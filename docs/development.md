@@ -249,8 +249,8 @@ closed afterwards.
 
 - `.github/workflows/ci.yml` runs format, check, tests, strict Clippy, and a
   release build on Ubuntu, macOS, and Windows.
-- Linux is the primary locally tested platform. macOS and Windows CI is
-  configured but has not been run.
+- CI has passed on all three platforms; native interactive verification remains
+  Linux-only.
 
 ## Known limits
 

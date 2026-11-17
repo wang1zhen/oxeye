@@ -84,7 +84,7 @@ Oxeye only reads images. It does not save, rename, delete, or rewrite them, and 
 - Windows: the MSVC Rust toolchain.
 - macOS: Xcode command line tools and Apple's deprecated OpenGL.
 
-Oxeye targets Linux, macOS, and Windows. Linux is the primary tested platform; macOS and Windows CI is configured but unverified. Details: [docs/development.md](docs/development.md#platform-prerequisites).
+Oxeye targets Linux, macOS, and Windows. Linux is the primary platform for native/interactive testing; CI passes on Linux, macOS, and Windows. Details: [docs/development.md](docs/development.md#platform-prerequisites).
 
 ## Development
 
@@ -94,4 +94,4 @@ cargo test --locked --all-targets
 
 Formatting, check, tests, Clippy, and release builds run in [.github/workflows/ci.yml](.github/workflows/ci.yml). See [docs/development.md](docs/development.md) for architecture and remaining unverified items.
 
-Current validation: 200 tests pass (2 ignored); format, check, and strict Clippy pass; a Linux release smoke covered a 6720×4480 image, populated previews, and dual infinite GIF Book playback. Windows and macOS CI remains unrun.
+Current validation: 200 tests pass (2 ignored); format, check, and strict Clippy pass; a Linux release smoke covered a 6720×4480 image, populated previews, and dual infinite GIF Book playback. Three-platform CI (format, check, tests, strict Clippy, release) passes on Linux, macOS, and Windows; native window testing remains Linux-only.

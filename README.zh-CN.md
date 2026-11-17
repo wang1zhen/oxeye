@@ -84,7 +84,7 @@ Oxeye 只读取图片，不保存、重命名、删除或改写文件；旋转�
 - Windows：MSVC Rust 工具链。
 - macOS：Xcode 命令行工具，以及 Apple 已弃用的 OpenGL。
 
-Oxeye 的目标平台是 Linux、macOS 和 Windows。Linux 是主要测试平台；macOS 和 Windows 的 CI 已配置但尚未验证。详情见 [docs/development.md](docs/development.md#platform-prerequisites)。
+Oxeye 的目标平台是 Linux、macOS 和 Windows。Linux 是原生/交互测试的主要平台；CI 已在 Linux、macOS 和 Windows 通过。详情见 [docs/development.md](docs/development.md#platform-prerequisites)。
 
 ## 开发
 
@@ -94,4 +94,4 @@ cargo test --locked --all-targets
 
 格式检查、编译检查、测试、Clippy 和发布构建由 [.github/workflows/ci.yml](.github/workflows/ci.yml) 执行。架构和尚未验证的项目见 [docs/development.md](docs/development.md)。
 
-当前验证：200 个测试通过（2 个忽略）；格式检查、编译检查和严格 Clippy 通过；Linux 发布版冒烟测试覆盖了 6720×4480 大图、已填充的预览条，以及书本模式双无限 GIF 播放。Windows 和 macOS CI 尚未运行。
+当前验证：200 个测试通过（2 个忽略）；格式检查、编译检查和严格 Clippy 通过；Linux 发布版冒烟测试覆盖了 6720×4480 大图、已填充的预览条，以及书本模式双无限 GIF 播放。三平台 CI（格式检查、编译检查、测试、严格 Clippy、发布构建）已在 Linux、macOS 和 Windows 通过；原生窗口测试仍以 Linux 为主。
