@@ -97,6 +97,8 @@ pub struct Catalog {
     pub showing_last: &'static str,
     pub settings_warning: &'static str,
     pub settings_saved: &'static str,
+    pub copied_image: &'static str,
+    pub copied_selected_page: &'static str,
     pub applying_saving: &'static str,
     pub reading_mode_saving: &'static str,
     pub previews_showing: &'static str,
@@ -199,6 +201,8 @@ pub static EN: Catalog = Catalog {
     showing_last: "showing last image",
     settings_warning: "Could not load settings; using defaults.",
     settings_saved: "Settings saved.",
+    copied_image: "Copied image",
+    copied_selected_page: "Copied selected page (spread too large to combine)",
     applying_saving: "Applied · saving settings…",
     reading_mode_saving: "Reading mode changed · saving…",
     previews_showing: "Showing previews · saving…",
@@ -301,6 +305,8 @@ pub static ZH: Catalog = Catalog {
     showing_last: "正在显示上一张",
     settings_warning: "无法加载设置，已使用默认值。",
     settings_saved: "设置已保存。",
+    copied_image: "已复制图片",
+    copied_selected_page: "已复制所选页面（跨页过大，无法合并）",
     applying_saving: "已应用 · 正在保存设置…",
     reading_mode_saving: "阅读模式已更改 · 正在保存…",
     previews_showing: "正在显示预览 · 保存中…",
@@ -403,6 +409,8 @@ pub static JA: Catalog = Catalog {
     showing_last: "前の画像を表示中",
     settings_warning: "設定を読み込めないため、既定値を使用します。",
     settings_saved: "設定を保存しました。",
+    copied_image: "画像をコピーしました",
+    copied_selected_page: "選択したページをコピーしました（見開きが大きすぎるため結合できません）",
     applying_saving: "適用しました・設定を保存中…",
     reading_mode_saving: "表示モードを変更しました・保存中…",
     previews_showing: "プレビューを表示・保存中…",
@@ -703,6 +711,8 @@ mod tests {
             ("showing_last", catalog.showing_last),
             ("settings_warning", catalog.settings_warning),
             ("settings_saved", catalog.settings_saved),
+            ("copied_image", catalog.copied_image),
+            ("copied_selected_page", catalog.copied_selected_page),
             ("applying_saving", catalog.applying_saving),
             ("reading_mode_saving", catalog.reading_mode_saving),
             ("previews_showing", catalog.previews_showing),
@@ -717,7 +727,7 @@ mod tests {
     #[test]
     fn every_catalog_field_is_non_empty() {
         for catalog in [&EN, &ZH, &JA] {
-            assert_eq!(fields(catalog).len(), 92, "catalog field list is stale");
+            assert_eq!(fields(catalog).len(), 94, "catalog field list is stale");
             for (name, value) in fields(catalog) {
                 assert!(!value.trim().is_empty(), "{name} is empty");
             }

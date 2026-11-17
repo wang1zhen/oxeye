@@ -9,6 +9,7 @@ A lightweight desktop image viewer built with Rust and egui. It focuses on fast 
 - Fast folder browsing with a bottom preview strip.
 - Large images shown with original detail, using tiled rendering.
 - Zoom, pan, fit-to-window, actual size, 90° rotation, and fullscreen.
+- Copy the current image to the clipboard.
 - Right-to-left Book mode with paired pages.
 - Decoded neighbor preload for quicker navigation.
 - Simple, uncluttered interface.
@@ -35,6 +36,7 @@ Without a path, Oxeye opens an empty window. Use Open, `Ctrl`/`Cmd`+`O`, or drop
 | Toggle Book mode | `M` |
 | Fit / actual size | `1` or `9` / `0` |
 | Zoom | `+`, `-`, or wheel |
+| Copy image | `Ctrl`+`C` / `Cmd`+`C` |
 | Rotate (display only) | `Ctrl`+`R` / `Ctrl`+`L` (`Cmd` on macOS) |
 | Fullscreen | `F11` or `Alt`+`Enter` |
 | Settings | `Ctrl`+`,` / `Cmd`+`,` |

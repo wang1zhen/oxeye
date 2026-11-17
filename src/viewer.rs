@@ -108,6 +108,65 @@ pub fn prepare_tiles(
 }
 
 pub const BOOK_GAP: u32 = 24;
+pub const COPY_SPREAD_LIMIT: usize = 256 * 1024 * 1024;
+
+/// Reject oversized or overflowing composites before allocating any pixels.
+pub fn copy_spread_dimensions(dimensions: &[(u32, u32)], limit: usize) -> Option<(u32, u32)> {
+    let mut pages = dimensions.iter();
+    let &(mut width, mut height) = pages.next()?;
+    for &(w, h) in pages {
+        width = width.checked_add(BOOK_GAP)?.checked_add(w)?;
+        height = height.max(h);
+    }
+    let bytes = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
+    (bytes <= limit).then_some((width, height))
+}
+
+fn copy_rotated(source: &RgbaImage, turns: u8) -> RgbaImage {
+    match turns % 4 {
+        0 => source.clone(),
+        1 => crate::model::rotate_image(source, true),
+        2 => image::imageops::rotate180(source),
+        _ => crate::model::rotate_image(source, false),
+    }
+}
+
+/// Source pages are in reading order (right first); output is visual left-to-right.
+/// The flag reports a primary-page fallback, not a clipboard backend result.
+pub fn copy_pixels(pages: &[&RgbaImage], turns: u8, limit: usize) -> Option<(RgbaImage, bool)> {
+    let primary = *pages.first()?;
+    if pages.len() == 1 {
+        return Some((copy_rotated(primary, turns), false));
+    }
+    let dimensions: Vec<_> = pages
+        .iter()
+        .map(|page| {
+            let (w, h) = page.dimensions();
+            if turns.is_multiple_of(2) {
+                (w, h)
+            } else {
+                (h, w)
+            }
+        })
+        .collect();
+    let Some((width, height)) = copy_spread_dimensions(&dimensions, limit) else {
+        return Some((copy_rotated(primary, turns), true));
+    };
+    let mut combined = RgbaImage::new(width, height);
+    let mut x = 0;
+    for (index, page) in pages.iter().rev().enumerate() {
+        let rotated = copy_rotated(page, turns);
+        // Replace rather than blend to preserve unmultiplied RGB and alpha.
+        image::imageops::replace(&mut combined, &rotated, i64::from(x), 0);
+        x += rotated.width();
+        if index + 1 < pages.len() {
+            x += BOOK_GAP;
+        }
+    }
+    Some((combined, false))
+}
 
 /// Joint spread bounds and page centers. The right page is first in reading
 /// order; shorter pages share the top edge.
@@ -291,6 +350,93 @@ impl Playback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_single_keeps_full_resolution_and_rotated_rgba_pixels() {
+        let source = RgbaImage::from_fn(2, 3, |x, y| {
+            let id = (y * 2 + x + 1) as u8;
+            image::Rgba([id, 9, 21, id * 30])
+        });
+        for (turns, size, ids) in [
+            (0, (2, 3), [1, 2, 3, 4, 5, 6]),
+            (1, (3, 2), [5, 3, 1, 6, 4, 2]),
+            (2, (2, 3), [6, 5, 4, 3, 2, 1]),
+            (3, (3, 2), [2, 4, 6, 1, 3, 5]),
+        ] {
+            let (copied, fallback) = copy_pixels(&[&source], turns, 0).unwrap();
+            assert!(!fallback, "single pages are not subject to the spread cap");
+            assert_eq!(copied.dimensions(), size);
+            for (pixel, id) in copied.pixels().zip(ids) {
+                assert_eq!(*pixel, image::Rgba([id, 9, 21, id * 30]));
+            }
+        }
+    }
+
+    #[test]
+    fn copy_book_uses_visual_order_transparent_gap_and_top_alignment() {
+        let right = RgbaImage::from_pixel(2, 2, image::Rgba([200, 10, 20, 127]));
+        let left = RgbaImage::from_pixel(1, 1, image::Rgba([10, 200, 20, 0]));
+        let (copied, fallback) = copy_pixels(&[&right, &left], 0, COPY_SPREAD_LIMIT).unwrap();
+        assert!(!fallback);
+        assert_eq!(copied.dimensions(), (3 + BOOK_GAP, 2));
+        for (x, y, pixel) in copied.enumerate_pixels() {
+            let expected = if x == 0 && y == 0 {
+                *left.get_pixel(0, 0)
+            } else if x > BOOK_GAP {
+                *right.get_pixel(0, 0)
+            } else {
+                image::Rgba([0, 0, 0, 0])
+            };
+            assert_eq!(*pixel, expected, "at {x},{y}");
+        }
+    }
+
+    #[test]
+    fn copy_book_rotates_each_page_before_composing() {
+        let right = RgbaImage::from_fn(2, 1, |x, _| image::Rgba([x as u8 + 1, 0, 0, 255]));
+        let left = RgbaImage::from_fn(1, 2, |_, y| image::Rgba([y as u8 + 3, 0, 0, 128]));
+        let (copied, fallback) = copy_pixels(&[&right, &left], 1, COPY_SPREAD_LIMIT).unwrap();
+        assert!(!fallback);
+        assert_eq!(copied.dimensions(), (3 + BOOK_GAP, 2));
+        assert_eq!(*copied.get_pixel(0, 0), image::Rgba([4, 0, 0, 128]));
+        assert_eq!(*copied.get_pixel(1, 0), image::Rgba([3, 0, 0, 128]));
+        assert_eq!(*copied.get_pixel(0, 1), image::Rgba([0, 0, 0, 0]));
+        assert_eq!(*copied.get_pixel(2 + BOOK_GAP, 0), *right.get_pixel(0, 0));
+        assert_eq!(*copied.get_pixel(2 + BOOK_GAP, 1), *right.get_pixel(1, 0));
+    }
+
+    #[test]
+    fn copy_spread_cap_is_checked_without_allocating_large_images() {
+        assert_eq!(
+            copy_spread_dimensions(&[(4096, 8192), (4072, 8192)], COPY_SPREAD_LIMIT),
+            Some((8192, 8192))
+        );
+        assert_eq!(
+            copy_spread_dimensions(&[(4096, 8192), (4073, 8192)], COPY_SPREAD_LIMIT),
+            None
+        );
+        assert_eq!(
+            copy_spread_dimensions(&[(u32::MAX, 1), (1, 1)], usize::MAX),
+            None
+        );
+        assert_eq!(
+            copy_spread_dimensions(&[(u32::MAX, u32::MAX)], usize::MAX),
+            None
+        );
+        let right = RgbaImage::from_pixel(2, 1, image::Rgba([1, 2, 3, 127]));
+        let left = RgbaImage::new(1, 2);
+        let bytes = (3 + BOOK_GAP) as usize * 2 * 4;
+        assert!(!copy_pixels(&[&right, &left], 1, bytes).unwrap().1);
+        let (copied, fallback) = copy_pixels(&[&right, &left], 1, bytes - 1).unwrap();
+        assert!(fallback);
+        assert_eq!(copied, crate::model::rotate_image(&right, true));
+    }
+
+    #[test]
+    fn copy_without_an_image_is_a_noop() {
+        assert_eq!(copy_pixels(&[], 0, COPY_SPREAD_LIMIT), None);
+        assert_eq!(copy_spread_dimensions(&[], COPY_SPREAD_LIMIT), None);
+    }
 
     #[test]
     fn rtl_spread_keeps_right_first_and_aligns_unequal_pages_at_top() {

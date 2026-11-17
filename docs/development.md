@@ -77,6 +77,11 @@ bindings.
   direction. `Space` pans down when possible, otherwise Single next / Book next
   spread.
 - `M` toggles Single/Book (without Shift); `P` controls GIF playback.
+- `Ctrl`/`Cmd`+`C` copies the current image. Single mode writes the current
+  full-resolution displayed frame with display rotation; GIFs copy the current
+  frame. Book mode writes both visible pages left-to-right with a transparent
+  gap, capped at 256 MiB; if the composite exceeds the cap it falls back to the
+  selected page with a localized notice.
 - `1`/`9` fit, `0` actual size, `+`/`-` zoom, `Ctrl`/`Cmd`+`R`/`L` rotate,
   `F11` or `Alt`+`Enter` fullscreen, and drag or `Alt`+drag pans.
 - `Escape` closes Settings first, then cancels queued navigation, then leaves
@@ -260,6 +265,8 @@ closed afterwards.
 - Per-image, thumbnail, and prefetch bounds are separate and are not a
   process-wide RSS cap.
 - Renderer upload errors cannot be recovered by retry.
+- Clipboard backend success cannot be detected; a failed copy is not
+  distinguishable from a successful one at the UI level.
 - Raw technical diagnostics, file names, paths, and format/key names remain
   untranslated.
 - Traditional Chinese is not translated. The README is available in English,

@@ -66,6 +66,7 @@ enum Action {
     Fullscreen,
     Escape,
     Open,
+    Copy,
     First,
     Last,
     Close,
@@ -79,6 +80,7 @@ fn key_action(key: Key, modifiers: Modifiers) -> Option<Action> {
     if modifiers.command && !modifiers.alt {
         return match key {
             Key::O => Some(Action::Open),
+            Key::C => Some(Action::Copy),
             Key::W => Some(Action::Close),
             Key::R => Some(Action::RotateRight),
             Key::L => Some(Action::RotateLeft),
@@ -1453,9 +1455,12 @@ impl Oxeye {
         }
         // The modal owns the keyboard; viewer shortcuts must not see these events.
         ctx.input_mut(|input| {
-            input
-                .events
-                .retain(|event| !matches!(event, egui::Event::Key { .. } | egui::Event::Text(_)))
+            input.events.retain(|event| {
+                !matches!(
+                    event,
+                    egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Copy
+                )
+            })
         });
         ctx.request_repaint();
     }
@@ -2236,6 +2241,39 @@ impl Oxeye {
         }
     }
 
+    fn copy_current_view(&mut self, ctx: &egui::Context) {
+        let Some(frame) = self
+            .media
+            .as_ref()
+            .and_then(|media| media.frames.get(self.frame))
+        else {
+            return;
+        };
+        let mut pages = vec![frame.pixels.as_ref()];
+        if self.display_mode == ReadingMode::Book {
+            pages.extend(self.other_pages.iter().filter_map(|page| {
+                page.media
+                    .frames
+                    .get(page.frame)
+                    .map(|frame| frame.pixels.as_ref())
+            }));
+        }
+        let Some((pixels, fallback)) =
+            viewer::copy_pixels(&pages, self.rotation.displayed, viewer::COPY_SPREAD_LIMIT)
+        else {
+            return;
+        };
+        let size = [pixels.width() as usize, pixels.height() as usize];
+        let image = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_raw());
+        ctx.copy_image(image);
+        let message = if fallback {
+            self.text().copied_selected_page
+        } else {
+            self.text().copied_image
+        };
+        self.set_feedback(FeedbackKind::Success, message.to_owned(), ctx);
+    }
+
     fn perform(&mut self, action: Action, viewport: Rect, ctx: &egui::Context) {
         match action {
             Action::Previous => self.enqueue_navigation(Navigation::Previous, ctx),
@@ -2291,6 +2329,7 @@ impl Oxeye {
                 }
             }
             Action::Open => self.open(ctx),
+            Action::Copy => self.copy_current_view(ctx),
             Action::First => self.edge(false, ctx),
             Action::Last => self.edge(true, ctx),
             Action::Close => self.request_close(ctx),
@@ -2306,6 +2345,12 @@ impl Oxeye {
         let events = ctx.input(|input| input.events.clone());
         let mut acted = false;
         for event in events {
+            // egui-winit consumes the native copy shortcut before emitting Key.
+            if matches!(event, egui::Event::Copy) {
+                self.perform(Action::Copy, viewport, ctx);
+                acted = true;
+                continue;
+            }
             if let egui::Event::Key {
                 key,
                 pressed: true,
@@ -3759,6 +3804,13 @@ mod tests {
 
     #[test]
     fn command_shortcuts_do_not_fire_for_plain_letters() {
+        assert_eq!(key_action(Key::C, Modifiers::COMMAND), Some(Action::Copy));
+        assert_eq!(key_action(Key::C, Modifiers::NONE), None);
+        assert_eq!(
+            key_action(Key::C, Modifiers::COMMAND | Modifiers::ALT),
+            None
+        );
+        assert_eq!(settings_key_action(Key::C, Modifiers::COMMAND), None);
         assert_eq!(key_action(Key::O, Modifiers::COMMAND), Some(Action::Open));
         assert_eq!(key_action(Key::O, Modifiers::NONE), None);
         assert_eq!(key_action(Key::W, Modifiers::COMMAND), Some(Action::Close));
