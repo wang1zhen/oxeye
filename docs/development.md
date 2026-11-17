@@ -174,7 +174,7 @@ bindings.
   no live language watch. `en*` maps to English, `ja*` to Japanese, and `zh`,
   `zh-CN`, `zh-SG`, or `zh-Hans*` to Simplified Chinese.
 - `zh-Hant` and unsupported locales map to English. Traditional Chinese is not
-  provided, and the README is not translated to Japanese.
+  provided. The README is available in English, Simplified Chinese, and Japanese.
 
 ## Tiling and GPU limits
 
@@ -262,7 +262,7 @@ closed afterwards.
 - Renderer upload errors cannot be recovered by retry.
 - Raw technical diagnostics, file names, paths, and format/key names remain
   untranslated.
-- Traditional Chinese is not translated, and the README has no Japanese
-  version.
-- Native Windows/macOS runs and MSRV 1.95 remain unverified; local checks used
-  Rust 1.99.
+- Traditional Chinese is not translated. The README is available in English,
+  Simplified Chinese, and Japanese.
+- Native GUI runs on Windows/macOS and MSRV 1.95 remain unverified; local checks
+  used Rust 1.99.
