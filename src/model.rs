@@ -1600,9 +1600,10 @@ mod tests {
         assert_eq!(names, ["A.JPG", "b.png", "d.webp", "e.PnG"]);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn handles_non_utf8_sibling_names() {
+        // macOS/APFS requires UTF-8 file names.
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
