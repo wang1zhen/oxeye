@@ -16,4 +16,5 @@
   Developer ID or notarization (Gatekeeper may block opening).
 - Linux baseline: Ubuntu 22.04 / glibc 2.35. AppImage needs host OpenGL/EGL,
   X11/Wayland libraries, and a desktop portal; it is not a fully bundled runtime.
-- Native installer smoke tests are pending the first release workflow run.
+- Native installer smoke tests passed in the three-platform release dry-run
+  (`workflow_dispatch` run 44086841142); artifacts are not publicly released.

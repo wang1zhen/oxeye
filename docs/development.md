@@ -18,8 +18,9 @@ pinned by `Cargo.lock`; no vendored sources are required.
 | `dirs` | `5.0.1` | User config directory |
 | `tempfile` | `3.27.0` | Same-directory atomic settings save |
 
-The package declares `rust-version = "1.95"`. Local validation used Rust 1.99;
-1.95 itself was not exercised.
+The package declares `rust-version = "1.95"`. Release packaging builds with Rust
+1.95.0, exercising compilation; local checks and the full test suite use Rust
+1.99. Full test-suite execution on 1.95 remains unverified.
 
 ## Module map
 
@@ -289,12 +290,22 @@ are registered.
 
 ### Installer verification and release flow
 
-Batch R1 adds syntax/metadata checks only; **none of the four installers has
-yet been packaged or installed locally**. Native CI smoke results are pending
-the first `workflow_dispatch` run, not implied by existing application CI.
-Local R1 checks passed: `bash -n` on both shell scripts,
+Batch R1 local checks passed: `bash -n` on both shell scripts,
 `desktop-file-validate packaging/linux/oxeye.desktop`, Python YAML/XML parsing
 and `plistlib` validation, and `cargo metadata --no-deps --format-version 1 --locked`.
+The three-platform release dry-run then succeeded via `workflow_dispatch` (run
+**44086841142**): the validate, Linux, macOS, and Windows jobs passed, and the
+publish job was skipped because the run was manual. Artifacts were MSI
+**3,682,304 B**; DMG **8,928,192 B**; deb **4,659,360 B**; AppImage
+**7,285,240 B**. These are Actions artifacts, not a public Release.
+
+Smoke coverage matched the workflow: MSI silent install/uninstall/Start Menu
+plus executable DLL imports; DMG `hdiutil verify`/mount, universal arm64/x86_64
+via `lipo`, and ad-hoc codesign; deb install/remove plus desktop validation;
+AppImage extract-and-run under Xvfb surviving timeout. Still unverified:
+interactive installer UI, real macOS Intel hardware, Gatekeeper/SmartScreen
+approval, actual GPU/hardware behavior, and any published Release.
+
 PowerShell parsing, WiX compilation, and Apple's native validation tools were
 unavailable on the Linux implementation host.
 
@@ -338,5 +349,5 @@ Only after user review should a maintainer run
   untranslated.
 - Traditional Chinese is not translated. The README is available in English,
   Simplified Chinese, and Japanese.
-- Native GUI runs on Windows/macOS and MSRV 1.95 remain unverified; local checks
-  used Rust 1.99.
+- Native GUI runs on Windows/macOS and full test-suite execution on MSRV 1.95
+  remain unverified; local checks used Rust 1.99 and release builds used 1.95.0.
