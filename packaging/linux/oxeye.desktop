@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Oxeye
+Comment=Lightweight image viewer
+Exec=oxeye %f
+Icon=oxeye
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=image/png;image/jpeg;image/gif;image/webp;image/bmp;image/x-icon;image/vnd.microsoft.icon;image/tiff;

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="Oxeye" Manufacturer="wang1zhen" Version="0.1.0"
+           Language="1033" Scope="perMachine"
+           UpgradeCode="6A6A9FE8-D8E1-47B9-8375-66AFA4A9D444">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Oxeye is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="OxeyeIcon" SourceFile="$(var.SourceDir)\assets\icons\oxeye.ico" />
+    <Property Id="ARPPRODUCTICON" Value="OxeyeIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/wang1zhen/oxeye" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Oxeye">
+        <Component Id="Application" Guid="*" Bitness="always64">
+          <File Id="OxeyeExe" Source="$(var.SourceDir)\target\x86_64-pc-windows-msvc\release\oxeye.exe" KeyPath="yes">
+            <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder"
+                      Name="Oxeye" Icon="OxeyeIcon" Advertise="yes"
+                      WorkingDirectory="INSTALLFOLDER" />
+          </File>
+          <File Id="License" Source="$(var.SourceDir)\LICENSE" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <Feature Id="MainFeature" Title="Oxeye" Level="1">
+      <ComponentRef Id="Application" />
+    </Feature>
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.SourceDir)\packaging\windows\license.rtf" />
+  </Package>
+</Wix>

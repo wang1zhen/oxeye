@@ -1,0 +1,220 @@
+name: Release installers
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "2"
+  RUSTUP_TOOLCHAIN: 1.95.0
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Validate release version and tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          manifest = Path("Cargo.toml").read_text().split("[dependencies]")[0]
+          version = re.search(r'^version = "([^"]+)"$', manifest, re.M).group(1)
+          assert version == "0.1.0", "Update installer versions and artifact names for a new release"
+          if os.environ["REF_TYPE"] == "tag":
+              assert os.environ["REF_NAME"] == f"v{version}", "Tag must match Cargo.toml"
+          PY
+
+  linux:
+    needs: validate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install build and smoke-test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev libegl1-mesa-dev \
+            libxcursor1 libxi6 libxrandr2 libfontconfig1 libdbus-1-3 \
+            desktop-file-utils squashfs-tools file curl xvfb xauth dbus-x11
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Package deb and AppImage
+        run: bash packaging/linux/package.sh
+      - name: Inspect and install/uninstall deb
+        run: |
+          desktop-file-validate packaging/linux/oxeye.desktop
+          dpkg-deb --info dist/oxeye-0.1.0-linux-amd64.deb
+          dpkg-deb --contents dist/oxeye-0.1.0-linux-amd64.deb
+          sudo apt-get install -y ./dist/oxeye-0.1.0-linux-amd64.deb
+          test -x /usr/bin/oxeye
+          test -f /usr/share/doc/oxeye/copyright
+          test -f /usr/share/icons/hicolor/512x512/apps/oxeye.png
+          desktop-file-validate /usr/share/applications/oxeye.desktop
+          sudo apt-get remove -y oxeye
+          test ! -e /usr/bin/oxeye
+      - name: Extract and launch AppImage without FUSE
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          image="$GITHUB_WORKSPACE/dist/oxeye-0.1.0-linux-x86_64.AppImage"
+          chmod +x "$image"
+          mkdir -p "$RUNNER_TEMP/oxeye-extract"
+          (cd "$RUNNER_TEMP/oxeye-extract" && "$image" --appimage-extract)
+          test -x "$RUNNER_TEMP/oxeye-extract/squashfs-root/AppRun"
+          test -f "$RUNNER_TEMP/oxeye-extract/squashfs-root/oxeye.png"
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          trap 'rm -rf "$XDG_RUNTIME_DIR"' EXIT
+          set +e
+          timeout 20s dbus-run-session -- xvfb-run -a "$image" --appimage-extract-and-run \
+            > dist/appimage-smoke.log 2>&1
+          status=$?
+          set -e
+          cat dist/appimage-smoke.log
+          # A launch must stay alive until timeout; early exit (even 0) fails smoke.
+          test "$status" -eq 124
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installers-linux
+          path: |
+            dist/*.deb
+            dist/*.AppImage
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: linux-smoke-logs
+          path: dist/*-smoke.log
+          if-no-files-found: ignore
+
+  macos:
+    needs: validate
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Package universal DMG
+        run: bash packaging/macos/package.sh
+      - name: Verify and mount DMG
+        run: |
+          image=dist/oxeye-0.1.0-macos-universal.dmg
+          hdiutil verify "$image"
+          mount="$RUNNER_TEMP/oxeye-mount"
+          mkdir -p "$mount"
+          hdiutil attach "$image" -readonly -nobrowse -mountpoint "$mount"
+          trap 'hdiutil detach "$mount"' EXIT
+          test "$(readlink "$mount/Applications")" = /Applications
+          test -f "$mount/Oxeye.app/Contents/Resources/LICENSE"
+          plutil -lint "$mount/Oxeye.app/Contents/Info.plist"
+          lipo -verify_arch arm64 x86_64 "$mount/Oxeye.app/Contents/MacOS/oxeye"
+          codesign --verify --deep --strict --verbose=2 "$mount/Oxeye.app"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installers-macos
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  windows:
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: "8.0.408"
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Package MSI
+        shell: pwsh
+        run: ./packaging/windows/package.ps1
+      - name: Silent MSI install and uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $msi = (Resolve-Path "dist/oxeye-0.1.0-windows-x86_64.msi").Path
+          $installLog = Join-Path $PWD "dist/msi-install.log"
+          $uninstallLog = Join-Path $PWD "dist/msi-uninstall.log"
+          $exe = Join-Path $env:ProgramFiles "Oxeye/oxeye.exe"
+          $shortcut = Join-Path $env:ProgramData "Microsoft/Windows/Start Menu/Programs/Oxeye.lnk"
+          try {
+              $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/i `"$msi`" /qn /norestart /l*v `"$installLog`""
+              if ($process.ExitCode -notin @(0, 3010)) { throw "MSI install failed: $($process.ExitCode)" }
+              if (!(Test-Path $exe)) { throw "Installed executable missing" }
+              if (!(Test-Path $shortcut)) { throw "Start Menu shortcut missing" }
+          } finally {
+              $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/x `"$msi`" /qn /norestart /l*v `"$uninstallLog`""
+              if ($process.ExitCode -notin @(0, 3010)) { throw "MSI uninstall failed: $($process.ExitCode)" }
+          }
+          if ((Test-Path $exe) -or (Test-Path $shortcut)) { throw "Uninstall left application files" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installers-windows
+          path: dist/*.msi
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: windows-smoke-logs
+          path: dist/msi-*.log
+          if-no-files-found: ignore
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: installers-*
+          merge-multiple: true
+          path: dist
+      - name: Check assets and write checksums
+        working-directory: dist
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          expected = {
+              "oxeye-0.1.0-linux-amd64.deb",
+              "oxeye-0.1.0-linux-x86_64.AppImage",
+              "oxeye-0.1.0-macos-universal.dmg",
+              "oxeye-0.1.0-windows-x86_64.msi",
+          }
+          assert {p.name for p in Path(".").iterdir()} == expected, "Expected exactly four installers"
+          PY
+          sha256sum oxeye-* > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Create draft release only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes \
+            --title "Oxeye $RELEASE_TAG" \
+            --notes "Windows is unsigned (SmartScreen may warn). macOS is ad-hoc signed, not notarized; use right-click Open or approve it in System Settings. Linux baseline: Ubuntu 22.04 / glibc 2.35; AppImage needs host OpenGL/EGL and desktop portal libraries. See SHA256SUMS to verify downloads." \
+            dist/*.deb dist/*.AppImage dist/*.dmg dist/*.msi dist/SHA256SUMS

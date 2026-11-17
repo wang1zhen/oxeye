@@ -4,6 +4,21 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A small read-only desktop image viewer built with egui"
+license = "MIT"
+repository = "https://github.com/wang1zhen/oxeye"
+
+[package.metadata.deb]
+maintainer = "wang1zhen <wang1zhendire@hotmail.com>"
+section = "graphics"
+priority = "optional"
+license-file = ["LICENSE", "0"]
+depends = "$auto, libgl1, libegl1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxrandr2, libfontconfig1, libdbus-1-3, zenity, xdg-desktop-portal, xdg-desktop-portal-gtk | xdg-desktop-portal-gnome | xdg-desktop-portal-kde"
+assets = [
+    ["target/release/oxeye", "usr/bin/oxeye", "755"],
+    ["packaging/linux/oxeye.desktop", "usr/share/applications/oxeye.desktop", "644"],
+    ["assets/icons/oxeye-256.png", "usr/share/icons/hicolor/256x256/apps/oxeye.png", "644"],
+    ["assets/icons/oxeye-512.png", "usr/share/icons/hicolor/512x512/apps/oxeye.png", "644"],
+]
 
 [dependencies]
 dirs = "=5.0.1"

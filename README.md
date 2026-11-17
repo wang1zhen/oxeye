@@ -18,6 +18,14 @@ A lightweight desktop image viewer built with Rust and egui. It focuses on fast 
 
 Planned, not implemented: lightweight editing with crop, saved rotation, and multi-image collage.
 
+## Download
+
+Installers are distributed through [GitHub Releases](https://github.com/wang1zhen/oxeye/releases).
+Windows MSI is unsigned and may trigger SmartScreen. macOS DMG has only an ad-hoc
+signature (no Developer ID/notarization): use right-click **Open** or allow it in System Settings if Gatekeeper blocks it.
+Linux x86_64 packages target Ubuntu 22.04 / glibc 2.35 or newer; AppImage still needs
+host OpenGL/EGL, X11/Wayland libraries, and a desktop portal.
+
 ## Quick start
 
 ```sh

@@ -18,6 +18,15 @@ Rust と egui で作られた軽量なデスクトップ画像ビューアーで
 
 計画中・未実装：トリミング、回転結果の保存、複数画像のコラージュなど、軽量な編集機能。
 
+## ダウンロード
+
+インストーラーは [GitHub Releases](https://github.com/wang1zhen/oxeye/releases) にあります。
+Windows MSI は未署名のため SmartScreen が警告する場合があります。macOS DMG は
+ad-hoc 署名のみで未公証です。Gatekeeper に拒否された場合は右クリックの「開く」、
+またはシステム設定から許可してください。Linux x86_64 は Ubuntu 22.04 / glibc 2.35
+以降が基準です。AppImage にもホスト側の OpenGL/EGL、X11/Wayland ライブラリと
+デスクトップ portal が必要です。
+
 ## クイックスタート
 
 ```sh

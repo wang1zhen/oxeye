@@ -18,6 +18,14 @@
 
 计划中、尚未实现：轻量编辑功能，包括裁剪、保存旋转结果和多图拼贴。
 
+## 下载
+
+安装包见 [GitHub Releases](https://github.com/wang1zhen/oxeye/releases)。
+Windows MSI 未签名，可能触发 SmartScreen。macOS DMG 仅作 ad-hoc 签名，未经公证；
+若被 Gatekeeper 拦截，请右键选择“打开”，或在系统设置中允许。
+Linux x86_64 以 Ubuntu 22.04 / glibc 2.35 为最低基线；AppImage 仍需主机提供
+OpenGL/EGL、X11/Wayland 库及桌面 portal。
+
 ## 快速开始
 
 ```sh

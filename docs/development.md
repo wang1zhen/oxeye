@@ -250,6 +250,73 @@ closed afterwards.
 - macOS: Xcode command line tools with Apple's deprecated OpenGL. The Metal
   toolchain is not used.
 
+## Packaging v0.1.0
+
+Release builds use Rust **1.95.0** with `--locked`; install that toolchain before
+running a packaging script. Run each script on its native OS from a checkout
+containing `assets/icons/oxeye-{1024,512,256}.png` and `assets/icons/oxeye.ico`.
+Build tools and installer definitions are separate from application source.
+
+| Platform | Command | Tools |
+| --- | --- | --- |
+| Linux x86_64 | `bash packaging/linux/package.sh` | Ubuntu 22.04, cargo-deb **3.8.0**, appimagetool **1.9.1**, type2-runtime **20251108**, curl, dpkg tools |
+| macOS universal | `bash packaging/macos/package.sh` | Xcode CLI tools: lipo, sips, iconutil, codesign, hdiutil; arm64 + x86_64 Rust targets |
+| Windows x64 | `pwsh -File packaging/windows/package.ps1` | MSVC/Windows SDK (including dumpbin), .NET SDK **8.0.408** in CI, WiX **7.0.1**, WixToolset.UI.wixext **7.0.1** |
+
+Scripts keep cargo-deb, WiX executables, and AppImage downloads in `.tools/`;
+AppImage tool/runtime downloads are SHA-256 checked. Windows tooling explicitly accepts
+the user-approved WiX 7 EULA/OSMF terms with `--acceptEula wix7`. WiX 7 retains
+the `http://wixtoolset.org/schemas/v4/wxs` XML namespace; this is not WiX 3
+authoring. Keep the checked-in MSI UpgradeCode unchanged between releases.
+
+Outputs in `dist/`:
+
+- `oxeye-0.1.0-windows-x86_64.msi` — per-machine Program Files install, Start
+  Menu shortcut, MIT license UI. Static CRT build; dumpbin checks for VC++ runtime imports.
+- `oxeye-0.1.0-macos-universal.dmg` — `Oxeye.app` plus `/Applications` link,
+  macOS 11.0 minimum, ad-hoc signed; **no Developer ID signing or notarization**.
+- `oxeye-0.1.0-linux-amd64.deb` — binary, desktop entry, icons, copyright,
+  explicit GL/EGL/X11/Wayland/fontconfig/D-Bus/Zenity/portal dependencies.
+- `oxeye-0.1.0-linux-x86_64.AppImage` — thin AppDir; preserves the caller's
+  working directory for relative image paths. Needs host graphics and portal
+  libraries; does not bundle graphics drivers or promise arbitrary-distro compatibility.
+
+Linux binaries use Ubuntu **22.04 / glibc 2.35** as their build baseline.
+Windows is unsigned and may trigger SmartScreen. macOS Gatekeeper may require
+right-click **Open** or approval in System Settings; ad-hoc signing is not
+Developer ID signing. No file associations or macOS file-open Apple Events
+are registered.
+
+### Installer verification and release flow
+
+Batch R1 adds syntax/metadata checks only; **none of the four installers has
+yet been packaged or installed locally**. Native CI smoke results are pending
+the first `workflow_dispatch` run, not implied by existing application CI.
+Local R1 checks passed: `bash -n` on both shell scripts,
+`desktop-file-validate packaging/linux/oxeye.desktop`, Python YAML/XML parsing
+and `plistlib` validation, and `cargo metadata --no-deps --format-version 1 --locked`.
+PowerShell parsing, WiX compilation, and Apple's native validation tools were
+unavailable on the Linux implementation host.
+
+`.github/workflows/release.yml` builds on Ubuntu 22.04, macOS, and Windows with
+pinned Rust/tools/Actions. It checks deb metadata and install/remove, AppImage
+extract-and-run under Xvfb without FUSE (process survives until timeout), DMG
+integrity/mount/universal architectures/ad-hoc signature, and MSI silent
+install/uninstall/Start Menu plus executable DLL imports. Installer execution
+does not replace interactive GUI or real-hardware checks; no macOS Intel
+hardware run, Gatekeeper/SmartScreen approval, or installer UI verification
+has been performed.
+
+Use `workflow_dispatch` for Batch R2; it uploads Actions artifacts **without
+creating a Release**. After successful smoke tests and independent review,
+push `v0.1.0` for Batch R3. Tag must match Cargo's version. The tag-only publish
+job requires exactly four installers, writes `SHA256SUMS`, and runs
+`gh release create --verify-tag --draft --generate-notes`; it never publishes
+automatically. Check downloads with `sha256sum --check SHA256SUMS` (Linux),
+`shasum -a 256` (macOS), or `Get-FileHash -Algorithm SHA256` (PowerShell).
+Only after user review should a maintainer run
+`gh release edit v0.1.0 --draft=false`.
+
 ## CI
 
 - `.github/workflows/ci.yml` runs format, check, tests, strict Clippy, and a
