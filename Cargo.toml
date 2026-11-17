@@ -1,0 +1,36 @@
+[package]
+name = "oxeye"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A small read-only desktop image viewer built with egui"
+
+[dependencies]
+dirs = "=5.0.1"
+eframe = { version = "=0.37.0", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "system_fonts",
+    "accesskit",
+    "wayland",
+    "x11",
+] }
+gif = "=0.14.2"
+rfd = "=0.18.0"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+sys-locale = "=0.3.2"
+tempfile = "=3.27.0"
+image = { version = "=0.25.10", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+    "ico",
+    "tiff",
+] }
+
+[profile.release]
+lto = "thin"
+strip = true
