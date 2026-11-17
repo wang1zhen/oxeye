@@ -18,13 +18,16 @@
                       Name="Oxeye" Icon="OxeyeIcon" Advertise="yes"
                       WorkingDirectory="INSTALLFOLDER" />
           </File>
-          <File Id="License" Source="$(var.SourceDir)\LICENSE" />
+        </Component>
+        <Component Id="License" Guid="*" Bitness="always64">
+          <File Id="License" Source="$(var.SourceDir)\LICENSE" KeyPath="yes" />
         </Component>
       </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
     <Feature Id="MainFeature" Title="Oxeye" Level="1">
       <ComponentRef Id="Application" />
+      <ComponentRef Id="License" />
     </Feature>
     <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
     <WixVariable Id="WixUILicenseRtf" Value="$(var.SourceDir)\packaging\windows\license.rtf" />

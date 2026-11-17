@@ -127,7 +127,7 @@ jobs:
           test "$(readlink "$mount/Applications")" = /Applications
           test -f "$mount/Oxeye.app/Contents/Resources/LICENSE"
           plutil -lint "$mount/Oxeye.app/Contents/Info.plist"
-          lipo -verify_arch arm64 x86_64 "$mount/Oxeye.app/Contents/MacOS/oxeye"
+          lipo "$mount/Oxeye.app/Contents/MacOS/oxeye" -verify_arch arm64 x86_64
           codesign --verify --deep --strict --verbose=2 "$mount/Oxeye.app"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

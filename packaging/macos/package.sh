@@ -18,7 +18,7 @@ app="$stage/dmg/Oxeye.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$stage/oxeye.iconset"
 lipo -create target/aarch64-apple-darwin/release/oxeye \
   target/x86_64-apple-darwin/release/oxeye -output "$app/Contents/MacOS/oxeye"
-lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/oxeye"
+lipo "$app/Contents/MacOS/oxeye" -verify_arch arm64 x86_64
 cp packaging/macos/Info.plist "$app/Contents/Info.plist"
 cp LICENSE "$app/Contents/Resources/LICENSE"
 for size in 16 32 128 256 512; do
