@@ -255,16 +255,17 @@ separate single-file component.
 
 ## Verification
 
-Working-tree status for v0.2.0 (2026-11-18, Linux/Rust 1.99):
+Final v0.2.0 status (2026-11-18, Linux/Rust 1.99):
 
 - `cargo fmt --all -- --check`: pass.
 - `cargo check --locked --all-targets`: pass.
 - `cargo test --locked --all-targets`: **293 pass, 2 ignored**.
 - `cargo clippy --locked --all-targets -- -D warnings`: pass.
-- v0.2.0 release packaging and installer smoke validation are pending; no
-  v0.2.0 artifact sizes, release build duration, or published Release is claimed
-  here. The previous v0.1.0 release evidence is historical and is not reused for
-  this version.
+- CI for commit `c5a4d99` passed on Linux, macOS, and Windows.
+- Release dry-run workflow 44252633961 and tag workflow 44254035119 succeeded;
+  the published release is
+  <https://github.com/wang1zhen/oxeye/releases/tag/v0.2.0>.
+- Native archive/wide-page visual and interactive acceptance remains unverified.
 
 Full acceptance commands:
 
@@ -354,9 +355,19 @@ component. This avoids a multi-file auto-GUID component.
 Local v0.2.0 checks passed: `bash -n` on both shell scripts,
 `desktop-file-validate packaging/linux/oxeye.desktop`, Python YAML/XML parsing
 and `plistlib` validation, and `cargo metadata --no-deps --format-version 1 --locked`.
-The v0.2.0 packaging dry-run and installer smoke results are pending and are not
-claimed here; the previous v0.1.0 dry-run validated workflow mechanics only, not
-these versioned artifacts. No v0.2.0 Release exists yet.
+The v0.2.0 packaging dry-run (workflow 44252633961) and tag workflow
+(44254035119) succeeded. `SHA256SUMS` verified all four assets:
+
+- `oxeye-0.2.0-linux-amd64.deb` — **5,339,784 B**
+- `oxeye-0.2.0-linux-x86_64.AppImage` — **8,194,552 B**
+- `oxeye-0.2.0-macos-universal.dmg` — **10,799,039 B**
+- `oxeye-0.2.0-windows-x86_64.msi` — **4,464,640 B**
+
+The v0.2.0 release is published at
+<https://github.com/wang1zhen/oxeye/releases/tag/v0.2.0>. Interactive installer
+UI, real macOS Intel hardware, Gatekeeper/SmartScreen approval, and actual
+GPU/hardware behavior remain unverified; Windows is unsigned and macOS is
+ad-hoc signed.
 
 `.github/workflows/release.yml` builds on Ubuntu 22.04, macOS, and Windows with
 pinned Rust/tools/Actions. It checks deb metadata/install/remove and bundled

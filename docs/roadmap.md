@@ -2,16 +2,7 @@
 
 ## Released
 
-**v0.1.0** — 2026-11-17
-
-- Rust + egui/eframe viewer.
-- Folder browsing, tiled large images, zoom/pan/fit/actual, rotation, fullscreen.
-- Clipboard copy, Book mode, preview strip, bounded preload, settings.
-- GIF animation, English/Simplified Chinese/Japanese UI.
-- Windows MSI, macOS universal DMG, Linux deb/AppImage.
-- Release: https://github.com/wang1zhen/oxeye/releases/tag/v0.1.0
-
-## v0.2.0 — implemented, release pending
+**v0.2.0** — 2026-11-18
 
 - Virtual archive reading for CBZ/ZIP, CBR/RAR, and CB7/7z without extracting to
   disk. RAR uses pure-Rust `rars`; no UnRAR.
@@ -20,9 +11,22 @@
 - Dynamic ComicLayout: single cover, automatic wide pages, and `W` manual
   override. Settings schema v4 adds `auto_wide`.
 - Third-party notices packaged with deb, AppImage, DMG, and MSI.
-- Current verification: 293 tests pass, 2 ignored; fmt/check/strict Clippy pass.
-- v0.2.0 installer packaging is prepared but the release dry-run, artifacts, and
-  published Release are still pending.
+- Dry-run workflow 44252633961 and tag workflow 44254035119 succeeded; CI for
+  commit c5a4d99 passed on Linux, macOS, and Windows.
+- Assets: deb 5,339,784 B; AppImage 8,194,552 B; DMG 10,799,039 B; MSI
+  4,464,640 B; SHA256SUMS verified all four.
+- Release: https://github.com/wang1zhen/oxeye/releases/tag/v0.2.0
+- Native archive/wide-page visual and interactive acceptance remains
+  unverified; Windows is unsigned and macOS is ad-hoc signed.
+
+**v0.1.0** — 2026-11-17
+
+- Rust + egui/eframe viewer.
+- Folder browsing, tiled large images, zoom/pan/fit/actual, rotation, fullscreen.
+- Clipboard copy, Book mode, preview strip, bounded preload, settings.
+- GIF animation, English/Simplified Chinese/Japanese UI.
+- Windows MSI, macOS universal DMG, Linux deb/AppImage.
+- Release: https://github.com/wang1zhen/oxeye/releases/tag/v0.1.0
 
 ## Next: lightweight editing
 
