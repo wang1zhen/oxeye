@@ -317,7 +317,7 @@ separate single-file component.
 
 ## Verification
 
-Final v0.3.0 status (2026-11-18, Linux/Rust 1.99):
+Final v0.3.0 status (2026-11-18, Linux/Rust 1.99; CI and dry-run on 2026-11-19):
 
 - `cargo fmt --all -- --check`: pass.
 - `CARGO_BUILD_JOBS=2 cargo check --locked --all-targets`: pass.
@@ -328,8 +328,15 @@ Final v0.3.0 status (2026-11-18, Linux/Rust 1.99):
 - `bash -n packaging/linux/package.sh`, `bash -n packaging/macos/package.sh`,
   `plistlib` parse of `packaging/macos/Info.plist` (both version keys `0.3.0`),
   and `python3` XML parse of `packaging/windows/main.wxs`: pass.
-- v0.3.0 CI, dry-run, and tag workflows have **not** been run. CI for the
-  previous v0.2.0 commit `c5a4d99` passed on Linux, macOS, and Windows.
+- CI for commit `8dffff8` passed on Linux, macOS, and Windows
+  (run 44321681029).
+- Packaging dry-run 44321689650 succeeded and uploaded all four installers. The
+  macOS job needed two `--failed` reruns because `macos-latest` was not assigned
+  for 15 minutes each time (queued, then cancelled with no steps and no runner);
+  the third attempt ran and passed. This was runner availability, not a script
+  failure.
+- The tag workflow and draft Release have **not** been run, so no published
+  0.3.0 assets or `SHA256SUMS` exist yet.
 - Native visual/interactive acceptance of the editing toolbar, crop overlay,
   save confirmation, and Save As dialog remains unverified.
 
@@ -421,12 +428,19 @@ v0.3.0 packaging definitions include `THIRD_PARTY_NOTICES.md` in the deb and
 AppImage docs, the DMG's `Resources`, and the MSI as a separate single-file
 component. This avoids a multi-file auto-GUID component.
 
-Local v0.3.0 checks passed: `bash -n packaging/linux/package.sh`, Python XML
-parsing of `packaging/windows/main.wxs`, and
+Local v0.3.0 checks passed: `bash -n packaging/linux/package.sh`, `bash -n
+packaging/macos/package.sh`, `plistlib` parsing of `packaging/macos/Info.plist`,
+Python XML parsing of `packaging/windows/main.wxs`, and
 `cargo metadata --no-deps --format-version 1 --locked`. The v0.3.0 packaging
-dry-run and tag workflow have **not** been run yet, so no 0.3.0 installer sizes,
-hashes, or release assets exist; previous release evidence stays in
-[CHANGELOG.md](../CHANGELOG.md) and [roadmap.md](roadmap.md). Interactive
+dry-run 44321689650 then succeeded and uploaded all four installers:
+
+- `oxeye-0.3.0-linux-amd64.deb` — **5,450,296 B**
+- `oxeye-0.3.0-linux-x86_64.AppImage` — **8,317,432 B**
+- `oxeye-0.3.0-macos-universal.dmg` — **11,259,563 B**
+- `oxeye-0.3.0-windows-x86_64.msi` — **4,608,000 B**
+
+These are dry-run artifact sizes, not published assets; the tag workflow, the
+`SHA256SUMS` file, and the draft Release have **not** been created. Interactive
 installer UI, real macOS Intel hardware, Gatekeeper/SmartScreen approval, and
 actual GPU/hardware behavior remain unverified; Windows is unsigned and macOS is
 ad-hoc signed. Native visual and interactive acceptance of the editing UI is

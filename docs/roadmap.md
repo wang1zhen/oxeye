@@ -10,11 +10,20 @@
 - Overwrite-first saving with an explicit confirmation (full path, format,
   metadata loss), plus Save As. Writes use a same-directory temp file, `fsync`,
   inherited permissions, and atomic persist; failure leaves the original intact.
-- Format whitelist for writing; GIF/TIFF/ICO and archive members stay read-only.
+- Format whitelist for writing: GIF/TIFF/ICO stay read-only, while archive
+  members can be edited but only saved as a copy.
 - Overwrite cache invalidation chain (`Prefetcher::forget_paths` → page
   dimensions → thumbnail generation → reload at turns=0).
 - Closing the window waits for a running image save; the edit session restores
   the original frame and display rotation on exit.
+- CI for commit 8dffff8 passed on Linux, macOS, and Windows (run 44321681029).
+  Packaging dry-run 44321689650 uploaded all four 0.3.0 installers (deb
+  5,450,296 B; AppImage 8,317,432 B; DMG 11,259,563 B; MSI 4,608,000 B). The
+  macOS job needed two reruns because `macos-latest` was not assigned for 15
+  minutes each time; the third attempt passed.
+- The tag workflow and draft Release have not been run. Native visual and
+  interactive acceptance of the editing UI remains unverified; Windows is
+  unsigned and macOS is ad-hoc signed.
 
 **v0.2.0** — 2026-11-18
 

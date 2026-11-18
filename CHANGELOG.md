@@ -11,9 +11,9 @@
 - Save strategy: overwrite-first with an explicit confirmation naming the full
   path and target format, plus Save As through the native file dialog. Ctrl/Cmd+S
   overwrites; Ctrl/Cmd+Shift+S writes a copy.
-- Format whitelist for writing: PNG, JPEG, WebP, BMP. GIF, TIFF, ICO, and
-  archive members are read-only; editing is rejected instead of silently
-  flattening animation or multi-page files.
+- Format whitelist for writing: PNG, JPEG, WebP, BMP. GIF, TIFF, and ICO are
+  read-only and editing is rejected instead of silently flattening animation or
+  multi-page files; archive members can be edited but only saved as a copy.
 - Atomic writes: same-directory temporary file, `sync_all`, inherited
   permissions, then atomic persist. Cancel or failure leaves the original bytes
   and permissions unchanged.
