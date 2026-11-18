@@ -19,6 +19,8 @@ use crate::model;
 
 const MAX_IMAGES: usize = 20_000;
 const MAX_METADATA: u64 = 16 * 1024 * 1024;
+const MAX_ARCHIVE_WORK: u64 = 256 * 1024 * 1024;
+const MAX_DICTIONARY_KB: usize = 128 * 1024;
 // Mirror zip 9.7's ZipIterable::try_new, including the in-memory footer size.
 const EOCD_SEARCH_WINDOW: usize =
     65_536 + size_of::<Zip32CentralDirectoryEnd>() + size_of::<Magic>();
@@ -26,6 +28,17 @@ const EOCD_SEARCH_WINDOW: usize =
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ArchiveKind {
     Zip,
+    Rar,
+    SevenZ,
+}
+
+pub fn archive_kind(path: &Path) -> Option<ArchiveKind> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "zip" | "cbz" => Some(ArchiveKind::Zip),
+        "rar" | "cbr" => Some(ArchiveKind::Rar),
+        "7z" | "cb7" => Some(ArchiveKind::SevenZ),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -111,11 +124,7 @@ pub fn catalog_for(path: &Path) -> Result<Catalog, String> {
     if !path.is_file() {
         return Err(format!("not a file: {}", path.display()));
     }
-    let archive = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip") || ext.eq_ignore_ascii_case("cbz"));
-    if !archive {
+    let Some(kind) = archive_kind(&path) else {
         if !model::supported_path(&path) {
             return Err(format!("unsupported image format: {}", path.display()));
         }
@@ -125,7 +134,7 @@ pub fn catalog_for(path: &Path) -> Result<Catalog, String> {
                 .map(SourceRef::File)
                 .collect(),
         });
-    }
+    };
     let file = File::open(&path).map_err(|err| format!("cannot open {}: {err}", path.display()))?;
     let metadata = file
         .metadata()
@@ -137,20 +146,18 @@ pub fn catalog_for(path: &Path) -> Result<Catalog, String> {
             .map_err(|err| format!("cannot read metadata of {}: {err}", path.display()))?,
     );
     let (archive_len, archive_mtime_secs, archive_mtime_nanos) = archive_fingerprint(before);
-    let mut zip = open_zip_reader(file)
-        .map_err(|err| format!("cannot read ZIP {}: {err}", path.display()))?;
-    let items = scan_zip(&mut zip, &path)?
+    let items = catalog_entries(file, &path, kind)?
         .into_iter()
-        .map(|(index, entry)| SourceRef::Archive {
+        .map(|entry| SourceRef::Archive {
             archive: path.clone(),
             archive_len,
             archive_mtime_secs,
             archive_mtime_nanos,
-            kind: ArchiveKind::Zip,
-            index,
-            name: entry_name(&entry),
-            size: entry.size(),
-            crc: entry.crc32(),
+            kind,
+            index: entry.index,
+            name: entry.name,
+            size: entry.size,
+            crc: entry.crc,
         })
         .collect::<Vec<_>>();
     if file_identity(&path) != Some(before) {
@@ -165,6 +172,200 @@ pub fn catalog_for(path: &Path) -> Result<Catalog, String> {
         natural_cmp(a, b)
     });
     Ok(Catalog { items })
+}
+
+#[derive(Debug)]
+struct Member {
+    index: usize,
+    name: String,
+    size: u64,
+    crc: u32,
+}
+
+fn catalog_entries(file: File, path: &Path, kind: ArchiveKind) -> Result<Vec<Member>, String> {
+    match kind {
+        ArchiveKind::Zip => {
+            let mut zip = open_zip_reader(file)
+                .map_err(|err| format!("cannot read ZIP {}: {err}", path.display()))?;
+            Ok(scan_zip(&mut zip, path)?
+                .into_iter()
+                .map(|(index, entry)| Member {
+                    index,
+                    name: entry_name(&entry),
+                    size: entry.size(),
+                    crc: entry.crc32(),
+                })
+                .collect())
+        }
+        ArchiveKind::Rar => scan_rar(&open_rar(file, path)?, path),
+        ArchiveKind::SevenZ => {
+            let mut file = file;
+            scan_seven(&open_seven(&mut file, path)?, path)
+        }
+    }
+}
+
+fn rar_options(cap: u64) -> rars::ArchiveReadOptions<'static> {
+    rars::ArchiveReadOptions::new()
+        .with_max_header_count(MAX_IMAGES as u64)
+        .with_max_header_bytes(MAX_METADATA)
+        .with_max_member_output_bytes(cap.min(MAX_ARCHIVE_WORK))
+        .with_max_total_output_bytes(MAX_ARCHIVE_WORK)
+        .with_max_reader_workspace_bytes(MAX_ARCHIVE_WORK)
+        .with_rar50_dictionary_size_limit((MAX_DICTIONARY_KB * 1024) as u64)
+        .with_rar50_decode_workers(0)
+        .with_threads(1)
+}
+
+fn rar_error(path: &Path, error: rars::Error) -> String {
+    if matches!(
+        error.kind(),
+        rars::ErrorKind::PasswordRequired | rars::ErrorKind::BadPassword
+    ) || matches!(
+        &error,
+        rars::Error::UnsupportedEncryption { .. }
+            | rars::Error::FeatureDisabled {
+                feature: "encryption",
+            }
+            | rars::Error::UnsupportedFamilyFeature {
+                feature: "encryption" | "RAR 5 encrypted headers",
+                ..
+            }
+    ) {
+        return format!("{}: encrypted archives are not supported", path.display());
+    }
+    format!("{}: RAR {}: {error}", path.display(), error.kind().code())
+}
+
+fn open_rar(file: File, path: &Path) -> Result<rars::Archive, String> {
+    rars::ArchiveReader::read_reader_with_options(file, rar_options(MAX_ARCHIVE_WORK))
+        .map_err(|err| rar_error(path, err))
+}
+
+fn scan_rar(archive: &rars::Archive, path: &Path) -> Result<Vec<Member>, String> {
+    let mut items = Vec::new();
+    let mut metadata = 0u64;
+    for (index, member) in archive.members().enumerate() {
+        let meta = &member.meta;
+        metadata = metadata
+            .saturating_add(meta.name.len() as u64 + size_of::<rars::ArchiveMember>() as u64);
+        if metadata > MAX_METADATA {
+            return Err(format!(
+                "{}: RAR metadata exceeds {MAX_METADATA} bytes",
+                path.display()
+            ));
+        }
+        if meta.is_encrypted {
+            return Err(format!(
+                "{}: encrypted archives are not supported",
+                path.display()
+            ));
+        }
+        if meta.is_split_before || meta.is_split_after {
+            return Err(format!("{}: unsupported multi-volume RAR", path.display()));
+        }
+        let mode = meta.file_attr & 0o170000;
+        let special = meta.attr_source() == rars::AttrSource::Unix && mode != 0 && mode != 0o100000;
+        let name = meta.name_lossy();
+        if meta.is_directory
+            || meta.is_redirection
+            || special
+            || !model::supported_path(Path::new(&name))
+        {
+            continue;
+        }
+        if items.len() >= MAX_IMAGES {
+            return Err(format!(
+                "{}: RAR has more than {MAX_IMAGES} image entries",
+                path.display()
+            ));
+        }
+        let crc = match member.detail {
+            rars::ArchiveMemberDetail::Rar15To40 { crc32, .. } => crc32,
+            rars::ArchiveMemberDetail::Rar50Plus { crc32, .. } => crc32.unwrap_or(0),
+            _ => 0,
+        };
+        items.push(Member {
+            index,
+            name,
+            size: meta.unpacked_size,
+            crc,
+        });
+    }
+    Ok(items)
+}
+
+fn seven_error(path: &Path, error: sevenz_rust2::Error) -> String {
+    if matches!(
+        error,
+        sevenz_rust2::Error::PasswordRequired | sevenz_rust2::Error::MaybeBadPassword(_)
+    ) {
+        return format!("{}: encrypted archives are not supported", path.display());
+    }
+    format!("{}: 7z {error}", path.display())
+}
+
+fn open_seven(file: &mut File, path: &Path) -> Result<sevenz_rust2::Archive, String> {
+    // Refuse recovery of a missing start header instead of scanning payloads.
+    let start =
+        read_at::<32>(file, 0).map_err(|err| format!("{}: 7z header: {err}", path.display()))?;
+    if start[8..32].iter().all(|byte| *byte == 0) {
+        return Err(format!("{}: malformed 7z start header", path.display()));
+    }
+    let archive = sevenz_rust2::Archive::read_with_memory_limit(
+        file,
+        &sevenz_rust2::Password::empty(),
+        (MAX_METADATA / 1024) as usize,
+    )
+    .map_err(|err| seven_error(path, err))?;
+    Ok(archive)
+}
+
+fn scan_seven(archive: &sevenz_rust2::Archive, path: &Path) -> Result<Vec<Member>, String> {
+    let mut items = Vec::new();
+    let mut metadata = 0u64;
+    for (index, entry) in archive.files.iter().enumerate() {
+        metadata = metadata.saturating_add(
+            entry.name.len() as u64 + size_of::<sevenz_rust2::ArchiveEntry>() as u64,
+        );
+        if metadata > MAX_METADATA {
+            return Err(format!(
+                "{}: 7z metadata exceeds {MAX_METADATA} bytes",
+                path.display()
+            ));
+        }
+        if archive.is_file_encrypted(index) {
+            return Err(format!(
+                "{}: encrypted archives are not supported",
+                path.display()
+            ));
+        }
+        // 7-Zip stores Unix mode in the upper word, and DOS reparse points
+        // identify Windows links even when no Unix mode is available.
+        let mode = (entry.windows_attributes >> 16) & 0o170000;
+        let special = entry.has_windows_attributes
+            && ((mode != 0 && mode != 0o100000) || entry.windows_attributes & 0x410 != 0);
+        if entry.is_directory
+            || entry.is_anti_item
+            || special
+            || !model::supported_path(Path::new(&entry.name))
+        {
+            continue;
+        }
+        if items.len() >= MAX_IMAGES {
+            return Err(format!(
+                "{}: 7z has more than {MAX_IMAGES} image entries",
+                path.display()
+            ));
+        }
+        items.push(Member {
+            index,
+            name: entry.name.clone(),
+            size: entry.size,
+            crc: if entry.has_crc { entry.crc as u32 } else { 0 },
+        });
+    }
+    Ok(items)
 }
 
 fn open_zip(path: &Path) -> Result<ZipIterable<File>, String> {
@@ -346,6 +547,7 @@ pub fn read_source_bytes(source: &SourceRef, cap: u64) -> Result<Vec<u8>, String
         }
         SourceRef::Archive {
             archive,
+            kind,
             index,
             size,
             ..
@@ -355,18 +557,39 @@ pub fn read_source_bytes(source: &SourceRef, cap: u64) -> Result<Vec<u8>, String
                 .ok_or_else(|| {
                     format!("{source}: archive changed or unreadable; reopen the archive")
                 })?;
-            let mut zip = open_zip(archive)?;
-            let entry = scan_zip(&mut zip, archive)?
-                .into_iter()
-                .find(|(i, _)| i == index)
-                .map(|(_, entry)| entry)
-                .ok_or_else(|| format!("{source}: not an image file entry"))?;
-            verify_entry(source, &entry)?;
-            let files = zip.files().map_err(|err| format!("{source}: {err}"))?;
-            let bytes = read_zip_entry(entry, files.reader_mut(), source, cap)?;
+            let bytes = match kind {
+                ArchiveKind::Zip => {
+                    let mut zip = open_zip(archive)?;
+                    let entry = scan_zip(&mut zip, archive)?
+                        .into_iter()
+                        .find(|(i, _)| i == index)
+                        .map(|(_, entry)| entry)
+                        .ok_or_else(|| format!("{source}: not an image file entry"))?;
+                    verify_entry(source, &entry)?;
+                    let files = zip.files().map_err(|err| format!("{source}: {err}"))?;
+                    read_zip_entry(entry, files.reader_mut(), source, cap)?
+                }
+                ArchiveKind::Rar => {
+                    let file = File::open(archive)
+                        .map_err(|err| format!("cannot open {source}: {err}"))?;
+                    let rar = open_rar(file, archive)?;
+                    verify_member_at(source, &scan_rar(&rar, archive)?)?;
+                    rar.read_member_at_with_options(*index, rar_options(cap))
+                        .map_err(|err| rar_error(archive, err))?
+                        .ok_or_else(|| format!("{source}: missing RAR member"))?
+                }
+                ArchiveKind::SevenZ => {
+                    let mut file = File::open(archive)
+                        .map_err(|err| format!("cannot open {source}: {err}"))?;
+                    let seven = open_seven(&mut file, archive)?;
+                    verify_member_at(source, &scan_seven(&seven, archive)?)?;
+                    read_seven_entry(&seven, &mut file, *index, cap, MAX_ARCHIVE_WORK)
+                        .map_err(|err| seven_error(archive, err))?
+                }
+            };
             if bytes.len() as u64 != *size {
                 return Err(format!(
-                    "{source}: ZIP entry size does not match its metadata"
+                    "{source}: archive entry size does not match its metadata"
                 ));
             }
             if file_identity(archive)
@@ -378,6 +601,92 @@ pub fn read_source_bytes(source: &SourceRef, cap: u64) -> Result<Vec<u8>, String
             Ok(bytes)
         }
     }
+}
+
+fn verify_member_at(source: &SourceRef, members: &[Member]) -> Result<(), String> {
+    let SourceRef::Archive {
+        index,
+        name,
+        size,
+        crc,
+        ..
+    } = source
+    else {
+        unreachable!()
+    };
+    if members.iter().any(|member| {
+        member.index == *index && member.name == *name && member.size == *size && member.crc == *crc
+    }) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{source}: archive entry changed or is not an image file; reopen the archive"
+        ))
+    }
+}
+
+fn read_seven_entry(
+    archive: &sevenz_rust2::Archive,
+    file: &mut File,
+    index: usize,
+    cap: u64,
+    work_cap: u64,
+) -> Result<Vec<u8>, sevenz_rust2::Error> {
+    use sevenz_rust2::{BlockDecoder, Error, Password};
+    let invalid = |message: &str| Error::Other(message.to_owned().into());
+    let entry = archive
+        .files
+        .get(index)
+        .ok_or_else(|| invalid("missing 7z entry"))?;
+    if !entry.has_stream && entry.size == 0 {
+        return Ok(Vec::new());
+    }
+    let block = archive
+        .stream_map
+        .file_block_index
+        .get(index)
+        .copied()
+        .flatten()
+        .ok_or_else(|| invalid("missing 7z data block"))?;
+    let mut current = archive.stream_map.block_first_file_index[block];
+    let mut remaining = work_cap.min(MAX_ARCHIVE_WORK);
+    let mut selected = None;
+    let password = Password::empty();
+    // A member without its own CRC needs full block validation, including any
+    // suffix; all discarded bytes share the same solid-work budget.
+    let complete_block = !entry.has_crc;
+    BlockDecoder::new_with_memory_limit(1, MAX_DICTIONARY_KB, block, archive, &password, file)
+        .for_each_entries(&mut |_, reader| {
+            let this = current;
+            current += 1;
+            if this > index && !complete_block {
+                return Ok(false);
+            }
+            let count = if this == index {
+                let mut bytes = Vec::new();
+                reader
+                    .take(cap.min(remaining).min(MAX_ARCHIVE_WORK).saturating_add(1))
+                    .read_to_end(&mut bytes)?;
+                let count = bytes.len() as u64;
+                if count > cap.min(MAX_ARCHIVE_WORK) {
+                    return Err(invalid("7z entry exceeds output limit"));
+                }
+                selected = Some(bytes);
+                count
+            } else {
+                std::io::copy(
+                    &mut reader.take(remaining.saturating_add(1)),
+                    &mut std::io::sink(),
+                )?
+            };
+            if count > remaining {
+                return Err(invalid("7z solid work exceeds output budget"));
+            }
+            remaining -= count;
+            // Continue once so the library performs its integrity/size checks.
+            Ok(true)
+        })?;
+    selected.ok_or_else(|| invalid("7z entry was not decoded"))
 }
 
 fn read_zip_entry(
@@ -465,17 +774,12 @@ pub fn source_identity(source: &SourceRef) -> Option<SourceIdentity> {
     // shortcut: replacements preserving length and mtime need content hashing
     // if this ever becomes a real freshness problem.
     let (len, modified) = file_identity(source.path())?;
-    if let SourceRef::Archive { archive, index, .. } = source {
+    if let SourceRef::Archive { archive, kind, .. } = source {
         if !matches_archive_fingerprint(source, (len, modified)) {
             return None;
         }
-        let mut zip = open_zip(archive).ok()?;
-        let entry = scan_zip(&mut zip, archive)
-            .ok()?
-            .into_iter()
-            .find(|(i, _)| i == index)?
-            .1;
-        verify_entry(source, &entry).ok()?;
+        let entries = catalog_entries(File::open(archive).ok()?, archive, *kind).ok()?;
+        verify_member_at(source, &entries).ok()?;
         if file_identity(archive)? != (len, modified) {
             return None;
         }
@@ -625,6 +929,423 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use test_support::{stored_zip, write_zip};
+
+    fn seven_fixture(
+        method: sevenz_rust2::EncoderMethod,
+        solid: bool,
+        entries: &[(&str, &[u8])],
+    ) -> Vec<u8> {
+        use sevenz_rust2::encoder_options::{EncoderOptions, LzmaOptions};
+        use sevenz_rust2::{EncoderConfiguration, EncoderMethod};
+        let mut config = EncoderConfiguration::new(method);
+        if method == EncoderMethod::LZMA {
+            let mut options = LzmaOptions::from_level(0);
+            options.set_dictionary_size(1 << 20);
+            config = config.with_options(EncoderOptions::Lzma(options));
+        }
+        seven_fixture_config(config, solid, entries)
+    }
+
+    fn seven_fixture_config(
+        config: sevenz_rust2::EncoderConfiguration,
+        solid: bool,
+        entries: &[(&str, &[u8])],
+    ) -> Vec<u8> {
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader};
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        writer.set_content_methods(vec![config]);
+        if solid {
+            writer
+                .push_archive_entries(
+                    entries
+                        .iter()
+                        .map(|(name, _)| ArchiveEntry::new_file(name))
+                        .collect(),
+                    entries
+                        .iter()
+                        .map(|(_, data)| SourceReader::new(Cursor::new(*data)))
+                        .collect(),
+                )
+                .unwrap();
+        } else {
+            for (name, data) in entries {
+                writer
+                    .push_archive_entry(ArchiveEntry::new_file(name), Some(Cursor::new(*data)))
+                    .unwrap();
+            }
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn archive_extensions_are_case_insensitive() {
+        for (name, kind) in [
+            ("a.ZIP", ArchiveKind::Zip),
+            ("a.cbZ", ArchiveKind::Zip),
+            ("a.RAR", ArchiveKind::Rar),
+            ("a.CbR", ArchiveKind::Rar),
+            ("a.7Z", ArchiveKind::SevenZ),
+            ("a.CB7", ArchiveKind::SevenZ),
+        ] {
+            assert_eq!(archive_kind(Path::new(name)), Some(kind));
+        }
+        assert_eq!(archive_kind(Path::new("image.png")), None);
+        assert_eq!(archive_kind(Path::new("no-extension")), None);
+    }
+
+    #[test]
+    fn rar4_rar5_stored_and_solid_fixtures_read_by_original_index() {
+        let legacy = b"Hello, RAR 3.x fixture world.\n".as_slice();
+        let modern = b"Hello, RAR 5.0 fixture world.\n".as_slice();
+        for (bytes, expected) in [
+            (
+                include_bytes!("../tests/fixtures/archives/rar4-stored.rar").as_slice(),
+                vec![(0, legacy)],
+            ),
+            (
+                include_bytes!("../tests/fixtures/archives/rar5-stored.rar").as_slice(),
+                vec![(0, modern)],
+            ),
+            (
+                include_bytes!("../tests/fixtures/archives/rar4-solid.rar").as_slice(),
+                vec![
+                    (
+                        1,
+                        b"shared prefix shared prefix shared prefix beta\n".as_slice(),
+                    ),
+                    (
+                        0,
+                        b"shared prefix shared prefix shared prefix alpha\n".as_slice(),
+                    ),
+                ],
+            ),
+            (
+                include_bytes!("../tests/fixtures/archives/rar5-solid.rar").as_slice(),
+                vec![(1, b"AAAAAAAA\n".as_slice()), (0, modern)],
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("book.CBR");
+            std::fs::write(&path, bytes).unwrap();
+            let items = catalog_for(&path).unwrap().items;
+            assert_eq!(items.len(), expected.len());
+            for (source, (original, data)) in items.iter().zip(expected) {
+                let SourceRef::Archive { index, kind, .. } = source else {
+                    panic!()
+                };
+                assert_eq!(*kind, ArchiveKind::Rar);
+                assert_eq!(*index, original);
+                assert_eq!(read_source_bytes(source, 1024).unwrap(), data);
+                assert!(read_source_bytes(source, data.len() as u64 - 1).is_err());
+                let identity = source_identity(source).unwrap();
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(identity.modified + std::time::Duration::from_secs(2))
+                    .unwrap();
+                assert!(
+                    read_source_bytes(source, 1024)
+                        .unwrap_err()
+                        .contains("archive changed")
+                );
+                assert!(source_identity(source).is_none());
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(identity.modified)
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn rar_encrypted_headers_and_payloads_are_explicitly_rejected() {
+        for bytes in [
+            include_bytes!("../tests/fixtures/archives/rar4-encrypted-payload.rar").as_slice(),
+            include_bytes!("../tests/fixtures/archives/rar4-encrypted-headers.rar").as_slice(),
+            include_bytes!("../tests/fixtures/archives/rar5-encrypted-payload.rar").as_slice(),
+            include_bytes!("../tests/fixtures/archives/rar5-encrypted-headers.rar").as_slice(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("encrypted.rar");
+            std::fs::write(&path, bytes).unwrap();
+            let error = catalog_for(&path).unwrap_err();
+            assert!(
+                error.contains("encrypted archives are not supported"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rar_crc_corruption_and_resource_limits_are_not_partial_successes() {
+        for bytes in [
+            include_bytes!("../tests/fixtures/archives/rar4-stored.rar").as_slice(),
+            include_bytes!("../tests/fixtures/archives/rar5-stored.rar").as_slice(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("corrupt.rar");
+            let mut bytes = bytes.to_vec();
+            let payload = bytes.windows(5).position(|part| part == b"Hello").unwrap();
+            bytes[payload] ^= 1;
+            std::fs::write(&path, &bytes).unwrap();
+            let source = catalog_for(&path).unwrap().items.remove(0);
+            let error = read_source_bytes(&source, 1024).unwrap_err();
+            assert!(error.contains("CHECKSUM_MISMATCH"), "{error}");
+            let parse = rars::ArchiveReader::read_reader_with_options(
+                Cursor::new(bytes),
+                rar_options(1024).with_max_header_bytes(1),
+            );
+            assert_eq!(parse.unwrap_err().kind(), rars::ErrorKind::ResourceLimit);
+        }
+        let bytes = include_bytes!("../tests/fixtures/archives/rar5-solid.rar").to_vec();
+        let archive =
+            rars::ArchiveReader::read_reader_with_options(Cursor::new(bytes), rar_options(1024))
+                .unwrap();
+        assert!(
+            archive
+                .read_member_at_with_options(1, rar_options(1024).with_max_total_output_bytes(1))
+                .is_err()
+        );
+        assert!(
+            archive
+                .read_member_at_with_options(
+                    1,
+                    rar_options(1024).with_rar50_dictionary_size_limit(0)
+                )
+                .is_err()
+        );
+        let options = rar_options(u64::MAX);
+        assert_eq!(options.max_header_count, Some(20_000));
+        assert_eq!(options.max_header_bytes, Some(MAX_METADATA));
+        assert_eq!(options.max_member_output_bytes, Some(MAX_ARCHIVE_WORK));
+        assert_eq!(options.max_reader_workspace_bytes, Some(MAX_ARCHIVE_WORK));
+        assert_eq!(options.rar50_dictionary_size_limit, Some(128 * 1024 * 1024));
+        assert_eq!(options.threads, Some(1));
+        assert_eq!(options.rar50_decode_workers, Some(0));
+    }
+
+    #[test]
+    fn seven_copy_and_lzma_solid_and_non_solid_keep_indices_order_and_caps() {
+        use sevenz_rust2::EncoderMethod;
+        for method in [
+            EncoderMethod::COPY,
+            EncoderMethod::LZMA,
+            EncoderMethod::LZMA2,
+            EncoderMethod::BZIP2,
+            EncoderMethod::PPMD,
+            EncoderMethod::DEFLATE,
+        ] {
+            for solid in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("book.CB7");
+                let bytes = seven_fixture(
+                    method,
+                    solid,
+                    &[
+                        ("page10.png", b"ten"),
+                        ("notes.txt", b"ignore"),
+                        ("page2.png", b"two"),
+                    ],
+                );
+                std::fs::write(&path, bytes).unwrap();
+                let items = catalog_for(&path).unwrap().items;
+                assert_eq!(items.len(), 2);
+                for (source, expected_index, data) in
+                    [(&items[0], 2, b"two"), (&items[1], 0, b"ten")]
+                {
+                    let SourceRef::Archive { kind, index, .. } = source else {
+                        panic!()
+                    };
+                    assert_eq!(*kind, ArchiveKind::SevenZ);
+                    assert_eq!(*index, expected_index);
+                    assert_eq!(read_source_bytes(source, 3).unwrap(), data);
+                    assert!(read_source_bytes(source, 2).is_err());
+                    assert!(source_identity(source).is_some());
+                }
+                let old = source_identity(&items[0]).unwrap();
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(old.modified + std::time::Duration::from_secs(2))
+                    .unwrap();
+                assert!(source_identity(&items[0]).is_none());
+                assert!(read_source_bytes(&items[0], 3).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn seven_solid_predecessors_and_crc_less_suffix_share_actual_work_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.7z");
+        let bytes = seven_fixture(
+            sevenz_rust2::EncoderMethod::COPY,
+            true,
+            &[
+                ("before.bin", &[1; 20]),
+                ("page.png", b"image"),
+                ("after.bin", &[2; 1024]),
+            ],
+        );
+        std::fs::write(&path, bytes).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let mut archive = open_seven(&mut file, &path).unwrap();
+        assert!(archive.is_solid);
+        assert_eq!(
+            read_seven_entry(&archive, &mut file, 1, 5, 25).unwrap(),
+            b"image"
+        );
+        assert!(
+            read_seven_entry(&archive, &mut file, 1, 5, 24)
+                .unwrap_err()
+                .to_string()
+                .contains("budget")
+        );
+        assert!(read_seven_entry(&archive, &mut file, 1, 4, 25).is_err());
+        archive.files[1].has_crc = false;
+        assert!(read_seven_entry(&archive, &mut file, 1, 5, 25).is_err());
+        assert_eq!(
+            read_seven_entry(&archive, &mut file, 1, 5, 1049).unwrap(),
+            b"image"
+        );
+    }
+
+    #[test]
+    fn seven_encrypted_headers_and_payloads_are_rejected() {
+        use sevenz_rust2::encoder_options::AesEncoderOptions;
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter, EncoderMethod, Password};
+        for headers in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("encrypted.7z");
+            let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+            writer.set_encrypt_header(headers);
+            writer.set_content_methods(vec![
+                AesEncoderOptions::new(Password::new("test")).into(),
+                EncoderMethod::COPY.into(),
+            ]);
+            writer
+                .push_archive_entry(
+                    ArchiveEntry::new_file("a.png"),
+                    Some(Cursor::new(b"secret")),
+                )
+                .unwrap();
+            std::fs::write(&path, writer.finish().unwrap().into_inner()).unwrap();
+            let error = catalog_for(&path).unwrap_err();
+            assert!(
+                error.contains("encrypted archives are not supported"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn seven_corrupt_payload_header_and_undersized_declarations_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.7z");
+        let good = seven_fixture(
+            sevenz_rust2::EncoderMethod::COPY,
+            false,
+            &[("a.png", b"pixels")],
+        );
+        let mut corrupt = good.clone();
+        corrupt[32] ^= 1;
+        std::fs::write(&path, corrupt).unwrap();
+        let source = catalog_for(&path).unwrap().items.remove(0);
+        assert!(
+            read_source_bytes(&source, 100)
+                .unwrap_err()
+                .contains("Checksum")
+        );
+        let mut corrupt = good.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, corrupt).unwrap();
+        assert!(catalog_for(&path).is_err());
+        std::fs::write(&path, good).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let mut archive = open_seven(&mut file, &path).unwrap();
+        archive.files[0].size = 1;
+        archive.files[0].has_crc = false;
+        assert!(read_seven_entry(&archive, &mut file, 0, 100, 100).is_err());
+    }
+
+    #[test]
+    fn seven_metadata_limits_and_link_filtering_apply_before_selection() {
+        use sevenz_rust2::{Archive, ArchiveEntry};
+        let path = Path::new("limit.cb7");
+        let mut archive = Archive::default();
+        archive.files = (0..=MAX_IMAGES)
+            .map(|_| ArchiveEntry::new_file("a.png"))
+            .collect();
+        assert!(scan_seven(&archive, path).unwrap_err().contains("20000"));
+        archive.files = vec![ArchiveEntry::new_file(&"x".repeat(MAX_METADATA as usize))];
+        assert!(scan_seven(&archive, path).unwrap_err().contains("metadata"));
+        let mut link = ArchiveEntry::new_file("link.png");
+        link.has_windows_attributes = true;
+        link.windows_attributes = 0o120777 << 16;
+        let mut reparse = ArchiveEntry::new_file("reparse.png");
+        reparse.has_windows_attributes = true;
+        reparse.windows_attributes = 0x400;
+        archive.files = vec![
+            link,
+            reparse,
+            ArchiveEntry::new_directory("directory.png"),
+            ArchiveEntry::new_file("valid.png"),
+        ];
+        let entries = scan_seven(&archive, path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].index, 3);
+    }
+
+    #[test]
+    fn seven_image_bytes_use_existing_decoder_and_large_model_is_refused() {
+        use crate::model::{DecodePurpose, load_media_for_source};
+        use sevenz_rust2::EncoderConfiguration;
+        use sevenz_rust2::encoder_options::{EncoderOptions, PpmdOptions};
+        use std::sync::atomic::AtomicBool;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("images.cb7");
+        let mut png = Cursor::new(Vec::new());
+        image::RgbaImage::new(3, 2)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(
+            &path,
+            seven_fixture(
+                sevenz_rust2::EncoderMethod::LZMA,
+                false,
+                &[("image.png", png.get_ref())],
+            ),
+        )
+        .unwrap();
+        let source = catalog_for(&path).unwrap().items.remove(0);
+        let media =
+            load_media_for_source(&source, &AtomicBool::new(false), DecodePurpose::Still).unwrap();
+        assert_eq!(media.frames[0].pixels.dimensions(), (3, 2));
+
+        // PPMD stores its model size in the coder properties; one KiB over the
+        // dictionary budget must be refused before decoding.
+        let path = dir.path().join("model.cb7");
+        let options = PpmdOptions::from_order_memory_size(6, (MAX_DICTIONARY_KB * 1024 + 1) as u32);
+        let config = EncoderConfiguration::new(sevenz_rust2::EncoderMethod::PPMD)
+            .with_options(EncoderOptions::Ppmd(options));
+        std::fs::write(
+            &path,
+            seven_fixture_config(config, false, &[("image.png", b"pixels")]),
+        )
+        .unwrap();
+        let mut file = File::open(&path).unwrap();
+        let archive = open_seven(&mut file, &path).unwrap();
+        assert!(
+            read_seven_entry(&archive, &mut file, 0, 1024, 1024)
+                .unwrap_err()
+                .to_string()
+                .contains("MaxMemLimited")
+        );
+    }
 
     #[derive(Debug)]
     struct CountingReader<R> {

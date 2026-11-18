@@ -2244,6 +2244,7 @@ impl Oxeye {
                 self.text().open_picker_title,
                 &[
                     "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "cbz", "zip",
+                    "cbr", "rar", "cb7", "7z",
                 ],
             )
             .pick_file()
