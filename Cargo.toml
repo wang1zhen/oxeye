@@ -1,6 +1,6 @@
 [package]
 name = "oxeye"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "A small read-only desktop image viewer built with egui"
@@ -18,6 +18,7 @@ assets = [
     ["packaging/linux/oxeye.desktop", "usr/share/applications/oxeye.desktop", "644"],
     ["assets/icons/oxeye-256.png", "usr/share/icons/hicolor/256x256/apps/oxeye.png", "644"],
     ["assets/icons/oxeye-512.png", "usr/share/icons/hicolor/512x512/apps/oxeye.png", "644"],
+    ["THIRD_PARTY_NOTICES.md", "usr/share/doc/oxeye/THIRD_PARTY_NOTICES.md", "644"],
 ]
 
 [dependencies]

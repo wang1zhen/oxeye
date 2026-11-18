@@ -34,7 +34,7 @@ jobs:
           from pathlib import Path
           manifest = Path("Cargo.toml").read_text().split("[dependencies]")[0]
           version = re.search(r'^version = "([^"]+)"$', manifest, re.M).group(1)
-          assert version == "0.1.0", "Update installer versions and artifact names for a new release"
+          assert version == "0.2.0", "Update installer versions and artifact names for a new release"
           if os.environ["REF_TYPE"] == "tag":
               assert os.environ["REF_NAME"] == f"v{version}", "Tag must match Cargo.toml"
           PY
@@ -62,11 +62,12 @@ jobs:
       - name: Inspect and install/uninstall deb
         run: |
           desktop-file-validate packaging/linux/oxeye.desktop
-          dpkg-deb --info dist/oxeye-0.1.0-linux-amd64.deb
-          dpkg-deb --contents dist/oxeye-0.1.0-linux-amd64.deb
-          sudo apt-get install -y ./dist/oxeye-0.1.0-linux-amd64.deb
+          dpkg-deb --info dist/oxeye-0.2.0-linux-amd64.deb
+          dpkg-deb --contents dist/oxeye-0.2.0-linux-amd64.deb
+          sudo apt-get install -y ./dist/oxeye-0.2.0-linux-amd64.deb
           test -x /usr/bin/oxeye
           test -f /usr/share/doc/oxeye/copyright
+          test -f /usr/share/doc/oxeye/THIRD_PARTY_NOTICES.md
           test -f /usr/share/icons/hicolor/512x512/apps/oxeye.png
           desktop-file-validate /usr/share/applications/oxeye.desktop
           sudo apt-get remove -y oxeye
@@ -75,12 +76,13 @@ jobs:
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: |
-          image="$GITHUB_WORKSPACE/dist/oxeye-0.1.0-linux-x86_64.AppImage"
+          image="$GITHUB_WORKSPACE/dist/oxeye-0.2.0-linux-x86_64.AppImage"
           chmod +x "$image"
           mkdir -p "$RUNNER_TEMP/oxeye-extract"
           (cd "$RUNNER_TEMP/oxeye-extract" && "$image" --appimage-extract)
           test -x "$RUNNER_TEMP/oxeye-extract/squashfs-root/AppRun"
           test -f "$RUNNER_TEMP/oxeye-extract/squashfs-root/oxeye.png"
+          test -f "$RUNNER_TEMP/oxeye-extract/squashfs-root/usr/share/doc/oxeye/THIRD_PARTY_NOTICES.md"
           export XDG_RUNTIME_DIR="$(mktemp -d)"
           trap 'rm -rf "$XDG_RUNTIME_DIR"' EXIT
           set +e
@@ -118,7 +120,7 @@ jobs:
         run: bash packaging/macos/package.sh
       - name: Verify and mount DMG
         run: |
-          image=dist/oxeye-0.1.0-macos-universal.dmg
+          image=dist/oxeye-0.2.0-macos-universal.dmg
           hdiutil verify "$image"
           mount="$RUNNER_TEMP/oxeye-mount"
           mkdir -p "$mount"
@@ -126,6 +128,7 @@ jobs:
           trap 'hdiutil detach "$mount"' EXIT
           test "$(readlink "$mount/Applications")" = /Applications
           test -f "$mount/Oxeye.app/Contents/Resources/LICENSE"
+          test -f "$mount/Oxeye.app/Contents/Resources/THIRD_PARTY_NOTICES.md"
           plutil -lint "$mount/Oxeye.app/Contents/Info.plist"
           lipo "$mount/Oxeye.app/Contents/MacOS/oxeye" -verify_arch arm64 x86_64
           codesign --verify --deep --strict --verbose=2 "$mount/Oxeye.app"
@@ -154,7 +157,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $msi = (Resolve-Path "dist/oxeye-0.1.0-windows-x86_64.msi").Path
+          $msi = (Resolve-Path "dist/oxeye-0.2.0-windows-x86_64.msi").Path
           $installLog = Join-Path $PWD "dist/msi-install.log"
           $uninstallLog = Join-Path $PWD "dist/msi-uninstall.log"
           $exe = Join-Path $env:ProgramFiles "Oxeye/oxeye.exe"
@@ -163,6 +166,7 @@ jobs:
               $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/i `"$msi`" /qn /norestart /l*v `"$installLog`""
               if ($process.ExitCode -notin @(0, 3010)) { throw "MSI install failed: $($process.ExitCode)" }
               if (!(Test-Path $exe)) { throw "Installed executable missing" }
+              if (!(Test-Path (Join-Path $env:ProgramFiles "Oxeye/THIRD_PARTY_NOTICES.md"))) { throw "Third-party notices missing" }
               if (!(Test-Path $shortcut)) { throw "Start Menu shortcut missing" }
           } finally {
               $process = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/x `"$msi`" /qn /norestart /l*v `"$uninstallLog`""
@@ -199,10 +203,10 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           expected = {
-              "oxeye-0.1.0-linux-amd64.deb",
-              "oxeye-0.1.0-linux-x86_64.AppImage",
-              "oxeye-0.1.0-macos-universal.dmg",
-              "oxeye-0.1.0-windows-x86_64.msi",
+              "oxeye-0.2.0-linux-amd64.deb",
+              "oxeye-0.2.0-linux-x86_64.AppImage",
+              "oxeye-0.2.0-macos-universal.dmg",
+              "oxeye-0.2.0-windows-x86_64.msi",
           }
           assert {p.name for p in Path(".").iterdir()} == expected, "Expected exactly four installers"
           PY

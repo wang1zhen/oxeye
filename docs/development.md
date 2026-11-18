@@ -12,6 +12,9 @@ pinned by `Cargo.lock`; no vendored sources are required.
 | `glow` | `0.17.0` | OpenGL renderer backend used by eframe |
 | `image` | `0.25.10` | Decoding, EXIF orientation, limits |
 | `gif` | `0.14.2` | GIF loop metadata and frame counting |
+| `zip` | `9.7.0` | CBZ/ZIP virtual archive reading |
+| `rars` | `0.13.0` | Pure-Rust CBR/RAR reading; no UnRAR |
+| `sevenz-rust2` | `0.25.0` | CB7/7z virtual archive reading |
 | `rfd` | `0.18.0` | Native file picker and error dialogs |
 | `sys-locale` | `0.3.2` | One-time OS locale lookup |
 | `serde`, `serde_json` | `1.0.229`, `1.0.154` | Settings persistence |
@@ -28,9 +31,13 @@ The package declares `rust-version = "1.95"`. Release packaging builds with Rust
   navigation-queue orchestration, candidate/gesture handling.
 - `model.rs` — bounded image reads, static decode, GIF preflight/composition,
   EXIF orientation, format detection, source limits.
+- `source.rs` — virtual `SourceRef` files/archive entries, ZIP/RAR/7z catalogs,
+  archive fingerprints, and bounded entry reads.
+- `progress.rs` — `progress.json` v1 resume store and per-page layout overrides.
+- `comic.rs` — dynamic Book layout with cover, wide-page, and manual overrides.
 - `preload.rs` — one-worker nearest-first decoded-neighbor cache, promotion,
   cancellation, Weak identity bookkeeping.
-- `settings.rs` — schema v3, migration, validation, atomic save, locale
+- `settings.rs` — schema v4, migration, validation, atomic save, locale
   resolution.
 - `navigation.rs` — framework-free file navigation math and the sequential
   navigation queue.
@@ -88,11 +95,60 @@ bindings.
 - `Escape` closes Settings first, then cancels queued navigation, then leaves
   fullscreen. It never quits the app.
 
+## Archive sources
+
+- A `SourceRef` is either a filesystem file or an archive member carrying
+  archive path, length/mtime fingerprint, format kind, entry index/name/size,
+  and CRC. Archive names are labels, never filesystem paths.
+- `source.rs` recognizes `.cbz`/`.zip`, `.cbr`/`.rar`, and `.cb7`/`.7z`.
+  `zip 9.7.0`, pure-Rust `rars 0.13.0`, and `sevenz-rust2 0.25.0` scan image
+  entries without extracting anything to disk. No UnRAR or native RAR code is
+  linked.
+- Catalog limits: at most 20,000 image entries, 16 MiB of archive metadata,
+  256 MiB of archive work/output/workspace, and a 128 MiB RAR dictionary.
+  Extracted entry bytes are also bounded by the model's per-image read cap.
+- Reads reopen the archive, verify the fingerprint and entry identity, and
+  stream the entry into the bounded decoder. Solid RAR/7z members may require
+  earlier pages to be decoded; there is no arbitrary random access inside a
+  solid block.
+- Fingerprints are archive path + length + modification time. A replacement
+  preserving both can miss changes; entry metadata checks catch most but not
+  all unchanged-member substitutions.
+
+## Third-party notices
+
+`[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)` lists the archive crates shipped in release binaries:
+`zip` (MIT), `rars` (Apache-2.0), and `sevenz-rust2` (Apache-2.0). It points to
+the RAR fixture provenance and license under `tests/fixtures/archives/`; no
+UnRAR or native RAR code is included. The application LICENSE remains MIT. The
+notice file is packaged in deb/AppImage docs, DMG `Resources`, and the MSI as a
+separate single-file component.
+
+## Reading progress
+
+- `progress.json` version 1 lives in the user config directory. Reads are
+  capped at 1 MiB, saves are atomic and serialized, and the store keeps at most
+  200 recently read books.
+- Records store a native path unit plus archive fingerprint, entry index/name,
+  last-read time, and per-page `Auto`/`Single`/`Spread` overrides. Opening an
+  archive resumes the stored entry when the fingerprint still matches; ordinary
+  folder images do not resume a stored position.
+- A fingerprint change ignores stale resume data and removes old overrides.
+  Corrupt or oversized progress files warn and are not auto-saved until the
+  user acts on a valid store.
+- `W` cycles the current page Auto → Single → Spread → Auto, persists the
+  override, and refreshes the Book layout. The cover remains single even with a
+  forced Spread.
+
 ## Book layout and whole-spread transaction
 
 - Source file order never changes. Book mode treats page 1 as a cover shown
   alone, then pairs right-even / left-odd pages, with a final single page when
   the count is odd. For six files: 1; right 2 / left 3; right 4 / left 5; 6.
+- Layout is dynamic. `auto_wide` (default on) shows a page alone when it is
+  wider than tall and `width * 5 > height * 6`; otherwise pages pair. `W`
+  overrides the current page for the next layout. Dimension probes are lazy and
+  limited to the current/neighbor range; the cover is always single.
 - Every entry point normalizes the current file to its containing spread.
   Opening a page lands on that spread and keeps the clicked page as the anchor.
 - The joint canvas top-aligns pages with different heights and keeps a shared
@@ -141,14 +197,15 @@ bindings.
 ## Settings
 
 - Settings are stored at `dirs::config_dir()/oxeye/settings.json`. The file is
-  capped at 64 KiB, must use flat schema version 3, and every field is
+  capped at 64 KiB, must use flat schema version 4, and every field is
   validated. Unknown fields and unsupported versions fall back to defaults with
   a warning.
-- Version-1 and version-2 files migrate by preserving existing custom cache and
-  reading values; missing newer fields take defaults. Loading never rewrites
-  the file. A migrated file is written as v3 only on an explicit save.
+- Version-1 through version-3 files migrate by preserving existing custom cache
+  and reading values; missing newer fields take defaults, including
+  `auto_wide = true`. Loading never rewrites the file. A migrated file is
+  written as v4 only on an explicit save.
 - Fields: `before`, `after`, `memory_mib`, `thumbnails_visible`,
-  `reading_mode`, `comic_arrow_direction`, and `language`.
+  `reading_mode`, `comic_arrow_direction`, `auto_wide`, and `language`.
 - Saves validate first, write and sync a same-directory `tempfile`, then persist
   atomically. Serialization prevents an older result from winning, and a failed
   save keeps the previous file.
@@ -198,17 +255,16 @@ bindings.
 
 ## Verification
 
-Final status (2026-11-17, Linux/Rust 1.99):
+Working-tree status for v0.2.0 (2026-11-18, Linux/Rust 1.99):
 
 - `cargo fmt --all -- --check`: pass.
 - `cargo check --locked --all-targets`: pass.
-- `cargo test --locked --all-targets`: **200 pass, 2 ignored**.
+- `cargo test --locked --all-targets`: **293 pass, 2 ignored**.
 - `cargo clippy --locked --all-targets -- -D warnings`: pass.
-- `cargo build --locked --release`: pass from a clean target in **1m42s**;
-  incremental **38.49s**. The stripped Linux binary was **15,416,760 bytes
-  (~14.7 MiB)**; this size is Linux-specific.
-- Explicit `real_input_images` + `real_input_preload`: pass in **17.32s**.
-- Ignored `target/` retains only local acceptance evidence (about 8.7 MB).
+- v0.2.0 release packaging and installer smoke validation are pending; no
+  v0.2.0 artifact sizes, release build duration, or published Release is claimed
+  here. The previous v0.1.0 release evidence is historical and is not reused for
+  this version.
 
 Full acceptance commands:
 
@@ -228,19 +284,16 @@ CARGO_BUILD_JOBS=2 cargo test --locked real_input_images -- --ignored --nocaptur
 CARGO_BUILD_JOBS=2 cargo test --locked real_input_preload -- --ignored --nocapture
 ```
 
-Native evidence from this rewrite used app-only captures by exact PID/UUID,
-never the full desktop, with private files kept under ignored
+Earlier native evidence for shared viewer behavior used app-only captures by
+exact PID/UUID, never the full desktop, with private files under ignored
 `target/acceptance/`. It covered a large image, a Book spread, dual
 finite+infinite and infinite+infinite spreads whose page regions changed,
-English/Simplified Chinese/Japanese and Automatic-Japanese screenshots, and CJK
-glyphs. Preview-strip visible and hidden states were also captured.
-Final release smoke used the same app-only method with no global input: a
-6720×4480 image displayed within about two seconds at 13% with populated
-previews, and Book mode in Japanese with two infinite GIFs changed both
-left/right page regions across captures. Settings-modal and input-driven
-behavior remain unit/source evidence only because no safe targeted Wayland
-input was available. No images were copied or uploaded, and test windows were
-closed afterwards.
+English/Simplified Chinese/Japanese and Automatic-Japanese screenshots, CJK
+glyphs, and visible/hidden preview strips. Settings-modal and input-driven
+behavior remain unit/source evidence only because no safe targeted Wayland input
+was available. Archive and wide-page native visual acceptance for v0.2.0 is not
+recorded here. No images were copied or uploaded, and test windows were closed
+afterwards.
 
 ## Platform prerequisites
 
@@ -251,7 +304,7 @@ closed afterwards.
 - macOS: Xcode command line tools with Apple's deprecated OpenGL. The Metal
   toolchain is not used.
 
-## Packaging v0.1.0
+## Packaging v0.2.0
 
 Release builds use Rust **1.95.0** with `--locked`; install that toolchain before
 running a packaging script. Run each script on its native OS from a checkout
@@ -272,15 +325,19 @@ authoring. Keep the checked-in MSI UpgradeCode unchanged between releases.
 
 Outputs in `dist/`:
 
-- `oxeye-0.1.0-windows-x86_64.msi` — per-machine Program Files install, Start
-  Menu shortcut, MIT license UI. Static CRT build; dumpbin checks for VC++ runtime imports.
-- `oxeye-0.1.0-macos-universal.dmg` — `Oxeye.app` plus `/Applications` link,
-  macOS 11.0 minimum, ad-hoc signed; **no Developer ID signing or notarization**.
-- `oxeye-0.1.0-linux-amd64.deb` — binary, desktop entry, icons, copyright,
-  explicit GL/EGL/X11/Wayland/fontconfig/D-Bus/Zenity/portal dependencies.
-- `oxeye-0.1.0-linux-x86_64.AppImage` — thin AppDir; preserves the caller's
-  working directory for relative image paths. Needs host graphics and portal
-  libraries; does not bundle graphics drivers or promise arbitrary-distro compatibility.
+- `oxeye-0.2.0-windows-x86_64.msi` — per-machine Program Files install, Start
+  Menu shortcut, MIT license UI, and separate single-file third-party notices
+  component. Static CRT build; dumpbin checks for VC++ runtime imports.
+- `oxeye-0.2.0-macos-universal.dmg` — `Oxeye.app` plus `/Applications` link,
+  macOS 11.0 minimum, ad-hoc signed; `Resources/` contains `LICENSE` and
+  `THIRD_PARTY_NOTICES.md`; **no Developer ID signing or notarization**.
+- `oxeye-0.2.0-linux-amd64.deb` — binary, desktop entry, icons, copyright,
+  `/usr/share/doc/oxeye/THIRD_PARTY_NOTICES.md`, and explicit
+  GL/EGL/X11/Wayland/fontconfig/D-Bus/Zenity/portal dependencies.
+- `oxeye-0.2.0-linux-x86_64.AppImage` — thin AppDir with LICENSE and third-party
+  notices under `usr/share/doc/oxeye`; preserves the caller's working directory
+  for relative image paths. Needs host graphics and portal libraries; does not
+  bundle graphics drivers or promise arbitrary-distro compatibility.
 
 Linux binaries use Ubuntu **22.04 / glibc 2.35** as their build baseline.
 Windows is unsigned and may trigger SmartScreen. macOS Gatekeeper may require
@@ -290,43 +347,35 @@ are registered.
 
 ### Installer verification and release flow
 
-Batch R1 local checks passed: `bash -n` on both shell scripts,
+v0.2.0 packaging definitions include `THIRD_PARTY_NOTICES.md` in the deb and
+AppImage docs, the DMG's `Resources`, and the MSI as a separate single-file
+component. This avoids a multi-file auto-GUID component.
+
+Local v0.2.0 checks passed: `bash -n` on both shell scripts,
 `desktop-file-validate packaging/linux/oxeye.desktop`, Python YAML/XML parsing
 and `plistlib` validation, and `cargo metadata --no-deps --format-version 1 --locked`.
-The three-platform release dry-run then succeeded via `workflow_dispatch` (run
-**44086841142**): the validate, Linux, macOS, and Windows jobs passed, and the
-publish job was skipped because the run was manual. Artifacts were MSI
-**3,682,304 B**; DMG **8,928,192 B**; deb **4,659,360 B**; AppImage
-**7,285,240 B**. These are Actions artifacts, not a public Release.
-
-Smoke coverage matched the workflow: MSI silent install/uninstall/Start Menu
-plus executable DLL imports; DMG `hdiutil verify`/mount, universal arm64/x86_64
-via `lipo`, and ad-hoc codesign; deb install/remove plus desktop validation;
-AppImage extract-and-run under Xvfb surviving timeout. Still unverified:
-interactive installer UI, real macOS Intel hardware, Gatekeeper/SmartScreen
-approval, actual GPU/hardware behavior, and any published Release.
-
-PowerShell parsing, WiX compilation, and Apple's native validation tools were
-unavailable on the Linux implementation host.
+The v0.2.0 packaging dry-run and installer smoke results are pending and are not
+claimed here; the previous v0.1.0 dry-run validated workflow mechanics only, not
+these versioned artifacts. No v0.2.0 Release exists yet.
 
 `.github/workflows/release.yml` builds on Ubuntu 22.04, macOS, and Windows with
-pinned Rust/tools/Actions. It checks deb metadata and install/remove, AppImage
-extract-and-run under Xvfb without FUSE (process survives until timeout), DMG
-integrity/mount/universal architectures/ad-hoc signature, and MSI silent
-install/uninstall/Start Menu plus executable DLL imports. Installer execution
-does not replace interactive GUI or real-hardware checks; no macOS Intel
-hardware run, Gatekeeper/SmartScreen approval, or installer UI verification
-has been performed.
+pinned Rust/tools/Actions. It checks deb metadata/install/remove and bundled
+notices, AppImage extract-and-run under Xvfb without FUSE plus notices, DMG
+integrity/mount/universal architectures/ad-hoc signature plus notices, and MSI
+silent install/uninstall/Start Menu/executable DLL imports plus notices.
+Installer execution does not replace interactive GUI or real-hardware checks; no
+macOS Intel hardware run, Gatekeeper/SmartScreen approval, or installer UI
+verification has been performed.
 
-Use `workflow_dispatch` for Batch R2; it uploads Actions artifacts **without
-creating a Release**. After successful smoke tests and independent review,
-push `v0.1.0` for Batch R3. Tag must match Cargo's version. The tag-only publish
-job requires exactly four installers, writes `SHA256SUMS`, and runs
-`gh release create --verify-tag --draft --generate-notes`; it never publishes
-automatically. Check downloads with `sha256sum --check SHA256SUMS` (Linux),
-`shasum -a 256` (macOS), or `Get-FileHash -Algorithm SHA256` (PowerShell).
-Only after user review should a maintainer run
-`gh release edit v0.1.0 --draft=false`.
+Use `workflow_dispatch` for the v0.2.0 dry-run; it uploads Actions artifacts
+**without creating a Release**. After successful smoke tests and independent
+review, push `v0.2.0` for the tag-only publish job. The tag must match
+Cargo.toml. The publish job requires exactly four installers, writes
+`SHA256SUMS`, and runs `gh release create --verify-tag --draft --generate-notes`;
+it never publishes automatically. Check downloads with
+`sha256sum --check SHA256SUMS` (Linux), `shasum -a 256` (macOS), or
+`Get-FileHash -Algorithm SHA256` (PowerShell). Only after user review should a
+maintainer run `gh release edit v0.2.0 --draft=false`.
 
 ## CI
 
@@ -342,6 +391,10 @@ Only after user review should a maintainer run
   metadata-identical symlink retargets can be missed.
 - Per-image, thumbnail, and prefetch bounds are separate and are not a
   process-wide RSS cap.
+- Archive reading is sequential; solid RAR/7z pages may require decoding
+  predecessors. No arbitrary random access exists inside a solid block.
+- Archive fingerprints are length + modification time; same-metadata
+  replacements can be missed. Encrypted and nested archives are unsupported.
 - Renderer upload errors cannot be recovered by retry.
 - Clipboard backend success cannot be detected; a failed copy is not
   distinguishable from a successful one at the UI level.

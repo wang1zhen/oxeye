@@ -7,10 +7,12 @@
 ## 功能
 
 - 快速浏览文件夹，底部带预览条。
+- 以虚拟文件夹方式读取 CBZ/ZIP、CBR/RAR 和 CB7/7z，无需解压。
 - 大图通过分块显示，保留原始细节。
 - 缩放、平移、适应窗口、原始尺寸、90° 旋转和全屏。
 - 将当前图片复制到剪贴板。
-- 从右到左的双页书本模式。
+- 从右到左的双页书本模式，支持自动宽页检测和 `W` 手动覆盖。
+- 在压缩包中记录并恢复阅读进度。
 - 预载相邻图片，切换更顺畅。
 - 简洁清爽的界面。
 
@@ -25,6 +27,7 @@ Windows MSI 未签名，可能触发 SmartScreen。macOS DMG 仅作 ad-hoc 签�
 若被 Gatekeeper 拦截，请右键选择“打开”，或在系统设置中允许。
 Linux x86_64 以 Ubuntu 22.04 / glibc 2.35 为最低基线；AppImage 仍需主机提供
 OpenGL/EGL、X11/Wayland 库及桌面 portal。
+第三方声明：[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 快速开始
 
@@ -34,6 +37,12 @@ cargo run --release --locked -- path/to/image.png
 
 不带路径时会打开空窗口。可以用 Open 按钮、`Ctrl`/`Cmd`+`O`，或把文件拖进窗口。
 
+## 格式
+
+- 图片：PNG、JPEG、WebP、BMP、ICO 和 TIFF；GIF 为动画格式。
+- 压缩包：CBZ/ZIP、CBR/RAR 和 CB7/7z 按虚拟文件夹读取，不释放到磁盘。
+- 固实 RAR/7z 页面可能需要先解码前面的页面。阅读进度按压缩包路径、长度和修改时间生成指纹；若替换后二者不变，可能无法识别。
+
 ## 操作
 
 | 操作 | 按键 |
@@ -42,6 +51,7 @@ cargo run --release --locked -- path/to/image.png
 | 上一张 / 下一张 | `PgUp` / `PgDn` |
 | 前后跳 10 个文件 | `Up` / `Down` |
 | 切换书本模式 | `M` |
+| 切换宽页 | `W` |
 | 适应窗口 / 原始尺寸 | `1` 或 `9` / `0` |
 | 缩放 | `+`、`-` 或滚轮 |
 | 复制图片 | `Ctrl`+`C` / `Cmd`+`C` |

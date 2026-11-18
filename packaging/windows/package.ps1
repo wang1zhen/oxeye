@@ -33,7 +33,7 @@ try {
     & $wix build --acceptEula wix7 -arch x64 `
         -ext WixToolset.UI.wixext/7.0.1 `
         -d "SourceDir=$root" `
-        -o "dist/oxeye-0.1.0-windows-x86_64.msi" `
+        -o "dist/oxeye-0.2.0-windows-x86_64.msi" `
         "packaging/windows/main.wxs"
 } finally {
     $env:RUSTUP_TOOLCHAIN = $oldToolchain

@@ -4,7 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 export RUSTUP_TOOLCHAIN=1.95.0
-version=0.1.0
+version=0.2.0
 tools="$root/.tools/appimage"
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
@@ -34,6 +34,7 @@ mkdir -p "$appdir/usr/bin" "$appdir/usr/share/doc/oxeye" \
   "$appdir/usr/share/icons/hicolor/512x512/apps"
 install -m 755 target/release/oxeye "$appdir/usr/bin/oxeye"
 install -m 644 LICENSE "$appdir/usr/share/doc/oxeye/LICENSE"
+install -m 644 THIRD_PARTY_NOTICES.md "$appdir/usr/share/doc/oxeye/THIRD_PARTY_NOTICES.md"
 install -m 644 packaging/linux/oxeye.desktop "$appdir/oxeye.desktop"
 install -m 644 packaging/linux/oxeye.desktop "$appdir/usr/share/applications/oxeye.desktop"
 install -m 644 assets/icons/oxeye-256.png "$appdir/usr/share/icons/hicolor/256x256/apps/oxeye.png"

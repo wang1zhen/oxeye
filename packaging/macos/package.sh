@@ -5,7 +5,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 export RUSTUP_TOOLCHAIN=1.95.0
 export MACOSX_DEPLOYMENT_TARGET=11.0
-version=0.1.0
+version=0.2.0
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$root/dist"
@@ -21,6 +21,7 @@ lipo -create target/aarch64-apple-darwin/release/oxeye \
 lipo "$app/Contents/MacOS/oxeye" -verify_arch arm64 x86_64
 cp packaging/macos/Info.plist "$app/Contents/Info.plist"
 cp LICENSE "$app/Contents/Resources/LICENSE"
+cp THIRD_PARTY_NOTICES.md "$app/Contents/Resources/THIRD_PARTY_NOTICES.md"
 for size in 16 32 128 256 512; do
   sips -z "$size" "$size" assets/icons/oxeye-1024.png \
     --out "$stage/oxeye.iconset/icon_${size}x${size}.png" >/dev/null
