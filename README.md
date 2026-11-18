@@ -16,7 +16,7 @@ A lightweight desktop image viewer built with Rust and egui. It focuses on fast 
 
 ## Roadmap
 
-Planned, not implemented: lightweight editing with crop, saved rotation, and multi-image collage.
+Planned, not implemented: lightweight editing with crop, saved rotation, and multi-image collage. See [docs/roadmap.md](docs/roadmap.md) for the detailed roadmap and current status.
 
 ## Download
 
