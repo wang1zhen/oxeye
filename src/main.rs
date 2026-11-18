@@ -4334,6 +4334,7 @@ mod tests {
 
     fn media(pixels: Arc<RgbaImage>) -> Arc<model::LoadedMedia> {
         Arc::new(model::LoadedMedia {
+            source: model::source::SourceRef::file(Path::new("fixture.png")),
             path: "fixture.png".into(),
             frames: vec![model::MediaFrame {
                 pixels,
@@ -4349,6 +4350,7 @@ mod tests {
         loop_mode: model::LoopMode,
     ) -> Arc<model::LoadedMedia> {
         Arc::new(model::LoadedMedia {
+            source: model::source::SourceRef::file(Path::new("animation.gif")),
             path: "animation.gif".into(),
             frames: frames
                 .into_iter()
@@ -4403,6 +4405,7 @@ mod tests {
     #[test]
     fn stale_playback_frame_is_replaced_with_requested_rotation() {
         let media = Arc::new(model::LoadedMedia {
+            source: model::source::SourceRef::file(Path::new("clock.gif")),
             path: "clock.gif".into(),
             loop_mode: model::LoopMode::Infinite,
             frames: (0..3)
@@ -4453,6 +4456,7 @@ mod tests {
             })
             .collect();
         let media = Arc::new(model::LoadedMedia {
+            source: model::source::SourceRef::file(Path::new("animation.gif")),
             path: "animation.gif".into(),
             frames,
             loop_mode: model::LoopMode::Finite(2),

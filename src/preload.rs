@@ -11,17 +11,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use crate::model::{DecodePurpose, LoadedMedia, load_media_for};
+use crate::model::source::{SourceIdentity, SourceRef, source_identity};
+use crate::model::{DecodePurpose, LoadedMedia, load_media_for_source};
 use crate::settings::PrefetchSettings;
 
 /// How often a foreground join rechecks its cancellation flag.
 const JOIN_TICK: Duration = Duration::from_millis(10);
 
 /// Injected decode function, replaced by deterministic fakes in tests.
-type DecodeFn =
-    dyn Fn(&Path, &AtomicBool, DecodePurpose) -> Result<Arc<LoadedMedia>, String> + Send + Sync;
+type DecodeFn = dyn Fn(&SourceRef, &AtomicBool, DecodePurpose) -> Result<Arc<LoadedMedia>, String>
+    + Send
+    + Sync;
 
 /// Guard for one foreground navigation transaction.
 ///
@@ -39,20 +41,13 @@ pub struct CacheStats {
     pub hits: u64,
 }
 
-/// Immutable identity of one file version.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileIdentity {
-    len: u64,
-    modified: SystemTime,
-}
-
 /// One decoded image together with the original identity it was verified
 /// against. Cache, reservation, joined handoff, and delivery all share this
 /// envelope so old pixels are never stamped with fresh metadata.
 #[derive(Clone)]
 struct DecodedEntry {
     media: Arc<LoadedMedia>,
-    identity: FileIdentity,
+    identity: SourceIdentity,
     purpose: DecodePurpose,
 }
 
@@ -67,7 +62,7 @@ struct CacheEntry {
 struct Job {
     id: u64,
     epoch: u64,
-    path: PathBuf,
+    path: SourceRef,
     purpose: DecodePurpose,
     cancel: Arc<AtomicBool>,
 }
@@ -88,7 +83,7 @@ struct Inflight {
 /// It leaves cache accounting immediately and stays outside the budget until
 /// `load` consumes it, because it is foreground ownership, not a cache alias.
 struct ForegroundReservation {
-    path: PathBuf,
+    path: SourceRef,
     decoded: DecodedEntry,
 }
 
@@ -107,7 +102,7 @@ enum JoinOutcome {
 #[derive(Clone)]
 struct RememberedEntry {
     media: Weak<LoadedMedia>,
-    identity: FileIdentity,
+    identity: SourceIdentity,
     purpose: DecodePurpose,
 }
 
@@ -115,7 +110,7 @@ impl RememberedEntry {
     fn from_entry(entry: &DecodedEntry) -> Self {
         Self {
             media: Arc::downgrade(&entry.media),
-            identity: entry.identity,
+            identity: entry.identity.clone(),
             purpose: entry.purpose,
         }
     }
@@ -124,7 +119,7 @@ impl RememberedEntry {
         let media = self.media.upgrade()?;
         Arc::ptr_eq(&media, displayed).then_some(DecodedEntry {
             media,
-            identity: self.identity,
+            identity: self.identity.clone(),
             purpose: self.purpose,
         })
     }
@@ -133,13 +128,13 @@ impl RememberedEntry {
 #[derive(Default)]
 struct State {
     settings: PrefetchSettings,
-    cache: HashMap<PathBuf, CacheEntry>,
+    cache: HashMap<SourceRef, CacheEntry>,
     bytes: u64,
     hits: u64,
     epoch: u64,
     purpose: DecodePurpose,
-    siblings: Vec<PathBuf>,
-    selected: Option<PathBuf>,
+    siblings: Vec<SourceRef>,
+    selected: Option<SourceRef>,
     /// Explicitly visible pages, at most two. Strong and never cache-charged.
     displayed: Vec<Arc<LoadedMedia>>,
     /// Non-owning original identities for the current displayed pages.
@@ -152,10 +147,10 @@ struct State {
     inflight: Option<Inflight>,
     foreground: Option<ForegroundReservation>,
     /// Latest path passed to [`Prefetcher::foreground_requested`].
-    foreground_target: Option<PathBuf>,
+    foreground_target: Option<SourceRef>,
     /// Generation of the current top-level foreground transaction.
     foreground_generation: u64,
-    failed: HashSet<PathBuf>,
+    failed: HashSet<SourceRef>,
     next_id: u64,
 }
 
@@ -173,11 +168,11 @@ struct Demand {
     epoch: u64,
     purpose: DecodePurpose,
     settings: PrefetchSettings,
-    selected: Option<PathBuf>,
-    order: Vec<PathBuf>,
-    failed: HashSet<PathBuf>,
-    cached: HashSet<PathBuf>,
-    visible: Vec<PathBuf>,
+    selected: Option<SourceRef>,
+    order: Vec<SourceRef>,
+    failed: HashSet<SourceRef>,
+    cached: HashSet<SourceRef>,
+    visible: Vec<SourceRef>,
 }
 
 struct Shared {
@@ -231,7 +226,9 @@ impl Prefetcher {
     pub fn new(settings: PrefetchSettings) -> Self {
         Self::spawn(
             settings,
-            Arc::new(|path, cancel, purpose| load_media_for(path, cancel, purpose).map(Arc::new)),
+            Arc::new(|path, cancel, purpose| {
+                load_media_for_source(path, cancel, purpose).map(Arc::new)
+            }),
         )
     }
 
@@ -265,7 +262,11 @@ impl Prefetcher {
     /// same-path in-flight decode is preserved and may also be promoted by
     /// [`Self::load`]; a different in-flight decode is asked to stop.
     pub fn foreground_requested(&self, path: &Path) -> ForegroundToken {
-        let absolute = absolute(path);
+        self.foreground_requested_source(&SourceRef::file(path))
+    }
+
+    pub fn foreground_requested_source(&self, source: &SourceRef) -> ForegroundToken {
+        let absolute = source.clone();
         let mut state = lock(&self.inner.shared.state);
         state.foreground_generation = state.foreground_generation.wrapping_add(1);
         let token = ForegroundToken(state.foreground_generation);
@@ -282,7 +283,11 @@ impl Prefetcher {
     /// an old Book worker cannot drop or cancel the new transaction's page.
     /// Valid partner promotion does not advance the generation.
     pub fn promote_if_current(&self, path: &Path, token: ForegroundToken) -> bool {
-        let absolute = absolute(path);
+        self.promote_source_if_current(&SourceRef::file(path), token)
+    }
+
+    pub fn promote_source_if_current(&self, source: &SourceRef, token: ForegroundToken) -> bool {
+        let absolute = source.clone();
         let mut state = lock(&self.inner.shared.state);
         if state.foreground_generation != token.0
             || self.inner.shared.shutdown.load(Ordering::Relaxed)
@@ -301,7 +306,15 @@ impl Prefetcher {
     /// caller's own cancellation flag; stale results still need to be rejected
     /// by the caller's revision check.
     pub fn load(&self, path: &Path, cancel: &AtomicBool) -> Result<Arc<LoadedMedia>, String> {
-        let absolute = absolute(path);
+        self.load_source(&SourceRef::file(path), cancel)
+    }
+
+    pub fn load_source(
+        &self,
+        source: &SourceRef,
+        cancel: &AtomicBool,
+    ) -> Result<Arc<LoadedMedia>, String> {
+        let absolute = source.clone();
         if cancel.load(Ordering::Relaxed) {
             return Err(format!("{}: cancelled", absolute.display()));
         }
@@ -347,8 +360,19 @@ impl Prefetcher {
         selected: Option<PathBuf>,
         displayed: Vec<Arc<LoadedMedia>>,
     ) {
-        let selected = selected.map(|path| absolute(&path));
-        let siblings: Vec<PathBuf> = siblings.into_iter().map(|path| absolute(&path)).collect();
+        self.update_context_many_sources(
+            siblings.iter().map(|path| SourceRef::file(path)).collect(),
+            selected.as_deref().map(SourceRef::file),
+            displayed,
+        );
+    }
+
+    pub fn update_context_many_sources(
+        &self,
+        siblings: Vec<SourceRef>,
+        selected: Option<SourceRef>,
+        displayed: Vec<Arc<LoadedMedia>>,
+    ) {
         let mut state = lock(&self.inner.shared.state);
         if state.siblings == siblings
             && state.selected == selected
@@ -385,8 +409,8 @@ impl Prefetcher {
             if inflight.job.purpose != purpose {
                 inflight.job.cancel.store(true, Ordering::Relaxed);
             } else if inflight.promoted {
-                let wanted = selected.as_deref() == Some(inflight.job.path.as_path())
-                    || foreground_target.as_deref() == Some(inflight.job.path.as_path());
+                let wanted = selected.as_ref() == Some(&inflight.job.path)
+                    || foreground_target.as_ref() == Some(&inflight.job.path);
                 if !wanted {
                     inflight.promoted = false;
                     inflight.job.cancel.store(true, Ordering::Relaxed);
@@ -406,7 +430,7 @@ impl Prefetcher {
             .iter()
             .filter_map(|media| {
                 if state.displayed.iter().any(|new| same_media(new, media))
-                    || state.selected.as_deref() == Some(media.path.as_path())
+                    || state.selected.as_ref() == Some(&media.source)
                 {
                     return None;
                 }
@@ -420,7 +444,7 @@ impl Prefetcher {
         drop(state);
 
         for entry in candidates {
-            let path = entry.media.path.clone();
+            let path = entry.media.source.clone();
             let mut state = lock(&self.inner.shared.state);
             if state.epoch == epoch {
                 admit(&mut state, &path, entry);
@@ -459,11 +483,16 @@ impl Prefetcher {
     /// reserving, recording a hit, or decoding; the caller must resize and drop
     /// it promptly. Returns `None` when the file is no longer fresh or was never
     /// recorded with an original identity.
+    #[allow(dead_code)] // Retained Path compatibility API.
     pub fn peek(&self, path: &Path, cancel: &AtomicBool) -> Option<Arc<LoadedMedia>> {
+        self.peek_source(&SourceRef::file(path), cancel)
+    }
+
+    pub fn peek_source(&self, source: &SourceRef, cancel: &AtomicBool) -> Option<Arc<LoadedMedia>> {
         if cancel.load(Ordering::Relaxed) {
             return None;
         }
-        let absolute = absolute(path);
+        let absolute = source.clone();
         let found = {
             let state = lock(&self.inner.shared.state);
             let cache = state
@@ -478,7 +507,7 @@ impl Prefetcher {
             let displayed = state
                 .displayed
                 .iter()
-                .find(|media| media.path == absolute)
+                .find(|media| media.source == absolute)
                 .and_then(|media| {
                     state
                         .displayed_identities
@@ -490,7 +519,7 @@ impl Prefetcher {
         if cancel.load(Ordering::Relaxed) {
             return None;
         }
-        if !readable_fresh(&absolute, found.identity) {
+        if !readable_fresh(&absolute, &found.identity) {
             return None;
         }
         Some(found.media)
@@ -549,7 +578,7 @@ impl Prefetcher {
         self.inner.shared.stop();
     }
 
-    fn take_cached(&self, path: &Path) -> Option<Arc<LoadedMedia>> {
+    fn take_cached(&self, path: &SourceRef) -> Option<Arc<LoadedMedia>> {
         let cached = {
             let state = lock(&self.inner.shared.state);
             state
@@ -558,7 +587,7 @@ impl Prefetcher {
                 .filter(|entry| entry.decoded.purpose == state.purpose)
                 .map(|entry| entry.decoded.clone())
         }?;
-        let fresh = readable_fresh(path, cached.identity);
+        let fresh = readable_fresh(path, &cached.identity);
 
         let mut state = lock(&self.inner.shared.state);
         let matching = state.cache.get(path).is_some_and(|entry| {
@@ -571,7 +600,7 @@ impl Prefetcher {
                 state.bytes = state.bytes.saturating_sub(entry.bytes);
                 state.hits += 1;
                 // Promoted to foreground ownership; do not re-prefetch it.
-                state.failed.insert(path.to_path_buf());
+                state.failed.insert(path.clone());
                 remember_delivery(&mut state, &entry.decoded);
                 return Some(entry.decoded.media);
             }
@@ -582,29 +611,29 @@ impl Prefetcher {
     }
 
     /// Consumes the latest foreground reservation if it is still fresh.
-    fn take_reserved(&self, path: &Path) -> Option<Arc<LoadedMedia>> {
+    fn take_reserved(&self, path: &SourceRef) -> Option<Arc<LoadedMedia>> {
         let reserved = {
             let state = lock(&self.inner.shared.state);
             state
                 .foreground
                 .as_ref()
                 .filter(|reservation| {
-                    reservation.path == path && reservation.decoded.purpose == state.purpose
+                    &reservation.path == path && reservation.decoded.purpose == state.purpose
                 })
                 .map(|reservation| reservation.decoded.clone())
         }?;
-        let fresh = readable_fresh(path, reserved.identity);
+        let fresh = readable_fresh(path, &reserved.identity);
 
         let mut state = lock(&self.inner.shared.state);
         let matching = state.foreground.as_ref().is_some_and(|reservation| {
-            reservation.path == path
+            &reservation.path == path
                 && reservation.decoded.purpose == state.purpose
                 && Arc::ptr_eq(&reservation.decoded.media, &reserved.media)
         });
         if fresh && matching {
             let reservation = state.foreground.take().expect("reserved entry");
             state.hits += 1;
-            state.failed.insert(path.to_path_buf());
+            state.failed.insert(path.clone());
             remember_delivery(&mut state, &reservation.decoded);
             return Some(reservation.decoded.media);
         }
@@ -615,21 +644,23 @@ impl Prefetcher {
     }
 
     /// Decodes `path` in the foreground and records its verified identity.
-    fn decode_fresh(&self, path: &Path, cancel: &AtomicBool) -> Result<Arc<LoadedMedia>, String> {
-        let identity = readable_identity(path);
+    fn decode_fresh(
+        &self,
+        path: &SourceRef,
+        cancel: &AtomicBool,
+    ) -> Result<Arc<LoadedMedia>, String> {
+        let identity = source_identity(path);
         let purpose = lock(&self.inner.shared.state).purpose;
         if cancel.load(Ordering::Relaxed) {
             return Err(format!("{}: cancelled", path.display()));
         }
-        lock(&self.inner.shared.state)
-            .failed
-            .insert(path.to_path_buf());
+        lock(&self.inner.shared.state).failed.insert(path.clone());
         let media = (self.inner.shared.decode)(path, cancel, purpose)?;
         if cancel.load(Ordering::Relaxed) || self.inner.shared.shutdown.load(Ordering::Relaxed) {
             return Err(format!("{}: cancelled", path.display()));
         }
         // All file I/O stays outside the shared mutex.
-        let verified = identity.filter(|identity| readable_fresh(path, *identity));
+        let verified = identity.filter(|identity| readable_fresh(path, identity));
         #[cfg(test)]
         if let Some(hook) = lock(&self.inner.shared.handoff_hook).take() {
             hook();
@@ -656,14 +687,14 @@ impl Prefetcher {
     }
 
     /// Attaches to a same-path in-flight job.
-    fn join_or_decode(&self, path: &Path, cancel: &AtomicBool) -> JoinOutcome {
+    fn join_or_decode(&self, path: &SourceRef, cancel: &AtomicBool) -> JoinOutcome {
         let shared = &self.inner.shared;
         let id = {
             let mut state = lock(&shared.state);
             let id = {
                 let purpose = state.purpose;
                 let Some(inflight) = state.inflight.as_mut().filter(|inflight| {
-                    inflight.job.path == path && inflight.job.purpose == purpose
+                    &inflight.job.path == path && inflight.job.purpose == purpose
                 }) else {
                     return JoinOutcome::NotInflight;
                 };
@@ -671,7 +702,7 @@ impl Prefetcher {
                 inflight.waiters += 1;
                 inflight.job.id
             };
-            state.failed.insert(path.to_path_buf());
+            state.failed.insert(path.clone());
             id
         };
 
@@ -710,7 +741,7 @@ impl Prefetcher {
                 }
                 return match result {
                     Ok(entry) => {
-                        if !readable_fresh(&entry.media.path, entry.identity) {
+                        if !readable_fresh(&entry.media.source, &entry.identity) {
                             return JoinOutcome::NotInflight;
                         }
                         let mut state = lock(&shared.state);
@@ -760,12 +791,12 @@ impl Prefetcher {
 }
 
 /// Shared foreground request mutation, called with the state lock held.
-fn common_request_mutation(state: &mut State, absolute: &Path) {
-    state.foreground_target = Some(absolute.to_path_buf());
+fn common_request_mutation(state: &mut State, absolute: &SourceRef) {
+    state.foreground_target = Some(absolute.clone());
     if state
         .foreground
         .as_ref()
-        .is_some_and(|reservation| reservation.path != absolute)
+        .is_some_and(|reservation| &reservation.path != absolute)
     {
         state.foreground = None;
     }
@@ -774,13 +805,13 @@ fn common_request_mutation(state: &mut State, absolute: &Path) {
     {
         state.bytes = state.bytes.saturating_sub(entry.bytes);
         state.foreground = Some(ForegroundReservation {
-            path: absolute.to_path_buf(),
+            path: absolute.clone(),
             decoded: entry.decoded,
         });
     }
-    state.failed.insert(absolute.to_path_buf());
+    state.failed.insert(absolute.clone());
     if let Some(inflight) = &mut state.inflight {
-        if inflight.job.path == absolute {
+        if &inflight.job.path == absolute {
             inflight.promoted = true;
         } else {
             inflight.promoted = false;
@@ -800,7 +831,7 @@ fn run(shared: Arc<Shared>) {
             {
                 continue;
             }
-            match readable_identity(path) {
+            match source_identity(path) {
                 Some(identity) => {
                     chosen = Some((path.clone(), identity));
                     break;
@@ -830,7 +861,7 @@ fn run(shared: Arc<Shared>) {
             && order.contains(&path)
             && !state.cache.contains_key(&path)
             && !state.failed.contains(&path)
-            && !state.displayed.iter().any(|media| media.path == path);
+            && !state.displayed.iter().any(|media| media.source == path);
         if !still_wanted {
             continue;
         }
@@ -869,10 +900,10 @@ fn wait_for_demand(shared: &Shared) -> Option<Demand> {
             && (state.settings.before > 0 || state.settings.after > 0)
             && let Some(order) = speculation_order(&state)
         {
-            let visible: Vec<PathBuf> = state
+            let visible: Vec<SourceRef> = state
                 .displayed
                 .iter()
-                .map(|media| media.path.clone())
+                .map(|media| media.source.clone())
                 .collect();
             let needed = order.iter().any(|path| {
                 !state.cache.contains_key(path)
@@ -901,22 +932,22 @@ fn wait_for_demand(shared: &Shared) -> Option<Demand> {
 
 fn execute(
     shared: &Shared,
-    path: &Path,
-    identity: FileIdentity,
+    path: &SourceRef,
+    identity: SourceIdentity,
     cancel: &AtomicBool,
     purpose: DecodePurpose,
 ) -> Result<DecodedEntry, String> {
     if cancel.load(Ordering::Relaxed) {
         return Err(format!("{}: cancelled", path.display()));
     }
-    if !readable_fresh(path, identity) {
+    if !readable_fresh(path, &identity) {
         return Err(format!("{}: file changed while preloading", path.display()));
     }
     let media = (shared.decode)(path, cancel, purpose)?;
     if cancel.load(Ordering::Relaxed) {
         return Err(format!("{}: cancelled", path.display()));
     }
-    if !readable_fresh(path, identity) {
+    if !readable_fresh(path, &identity) {
         return Err(format!("{}: file changed while preloading", path.display()));
     }
     Ok(DecodedEntry {
@@ -926,7 +957,7 @@ fn execute(
     })
 }
 
-fn finish(shared: &Shared, id: u64, path: PathBuf, result: Result<DecodedEntry, String>) {
+fn finish(shared: &Shared, id: u64, path: SourceRef, result: Result<DecodedEntry, String>) {
     let mut state = lock(&shared.state);
     let Some(mut inflight) = state.inflight.take() else {
         return;
@@ -959,8 +990,8 @@ fn finish(shared: &Shared, id: u64, path: PathBuf, result: Result<DecodedEntry, 
                 // reservation until `load` (or a newer request) takes it.
                 let keep = state
                     .foreground_target
-                    .as_deref()
-                    .is_none_or(|target| target == path)
+                    .as_ref()
+                    .is_none_or(|target| target == &path)
                     && state
                         .foreground
                         .as_ref()
@@ -1046,11 +1077,11 @@ pub(crate) fn neighbor_order(
 }
 
 /// Nearest-first files strictly outside the visible span.
-fn neighbor_order_span(
-    siblings: &[PathBuf],
+fn neighbor_order_span<T: Clone>(
+    siblings: &[T],
     (first, last): (usize, usize),
     settings: &PrefetchSettings,
-) -> Vec<PathBuf> {
+) -> Vec<T> {
     let mut order = Vec::new();
     for distance in 1..=settings.before.max(settings.after) {
         if distance <= settings.after
@@ -1068,7 +1099,7 @@ fn neighbor_order_span(
 }
 
 fn selected_index(state: &State) -> Option<usize> {
-    let selected = state.selected.as_deref()?;
+    let selected = state.selected.as_ref()?;
     state.siblings.iter().position(|path| path == selected)
 }
 
@@ -1076,7 +1107,7 @@ fn selected_index(state: &State) -> Option<usize> {
 fn committed_span(state: &State) -> Option<(usize, usize)> {
     let mut span: Option<(usize, usize)> = None;
     for media in &state.displayed {
-        let Some(index) = state.siblings.iter().position(|path| path == &media.path) else {
+        let Some(index) = state.siblings.iter().position(|path| path == &media.source) else {
             continue;
         };
         span = Some(match span {
@@ -1101,7 +1132,7 @@ fn speculation_span(state: &State) -> Option<(usize, usize)> {
     (first <= selected_index && selected_index <= last).then_some((first, last))
 }
 
-fn speculation_order(state: &State) -> Option<Vec<PathBuf>> {
+fn speculation_order(state: &State) -> Option<Vec<SourceRef>> {
     speculation_span(state).map(|span| neighbor_order_span(&state.siblings, span, &state.settings))
 }
 
@@ -1110,7 +1141,7 @@ fn speculation_order(state: &State) -> Option<Vec<PathBuf>> {
 /// A pending selected file that is already known keeps its own single-file
 /// range while old pages are still displayed. Unknown folders retain nothing,
 /// so stale entries from the previous directory cannot survive.
-fn retention_order(state: &State) -> Vec<PathBuf> {
+fn retention_order(state: &State) -> Vec<SourceRef> {
     let Some(selected_index) = selected_index(state) else {
         return Vec::new();
     };
@@ -1133,7 +1164,7 @@ fn retention_order(state: &State) -> Vec<PathBuf> {
 fn rebalance(state: &mut State) {
     let order = retention_order(state);
     let selected = state.selected.clone();
-    let stale: Vec<PathBuf> = state
+    let stale: Vec<SourceRef> = state
         .cache
         .iter()
         .filter(|(path, entry)| {
@@ -1142,7 +1173,7 @@ fn rebalance(state: &mut State) {
                 || state
                     .displayed
                     .iter()
-                    .any(|media| Arc::ptr_eq(media, &entry.decoded.media) || media.path == **path)
+                    .any(|media| Arc::ptr_eq(media, &entry.decoded.media) || media.source == **path)
         })
         .map(|(path, _)| path.clone())
         .collect();
@@ -1153,14 +1184,14 @@ fn rebalance(state: &mut State) {
 }
 
 /// Inserts a decoded neighbor if it is in range, not an alias, and fits.
-fn admit(state: &mut State, path: &Path, decoded: DecodedEntry) -> bool {
+fn admit(state: &mut State, path: &SourceRef, decoded: DecodedEntry) -> bool {
     if state.settings.memory_mib == 0 || (state.settings.before == 0 && state.settings.after == 0) {
         return false;
     }
     if decoded.purpose != state.purpose {
         return false;
     }
-    if state.selected.as_deref() == Some(path) {
+    if state.selected.as_ref() == Some(path) {
         return false;
     }
     if state.cache.contains_key(path) {
@@ -1169,7 +1200,7 @@ fn admit(state: &mut State, path: &Path, decoded: DecodedEntry) -> bool {
     if state
         .displayed
         .iter()
-        .any(|displayed| Arc::ptr_eq(displayed, &decoded.media) || displayed.path == path)
+        .any(|displayed| Arc::ptr_eq(displayed, &decoded.media) || &displayed.source == path)
     {
         return false;
     }
@@ -1191,13 +1222,13 @@ fn admit(state: &mut State, path: &Path, decoded: DecodedEntry) -> bool {
     }
     state
         .cache
-        .insert(path.to_path_buf(), CacheEntry { decoded, bytes });
+        .insert(path.clone(), CacheEntry { decoded, bytes });
     state.bytes += bytes;
     enforce_budget(state, &order);
     state.cache.contains_key(path)
 }
 
-fn enforce_budget(state: &mut State, order: &[PathBuf]) {
+fn enforce_budget(state: &mut State, order: &[SourceRef]) {
     let budget = state.settings.memory_mib.saturating_mul(1024 * 1024);
     for path in order.iter().rev() {
         if state.bytes <= budget {
@@ -1211,7 +1242,7 @@ fn enforce_budget(state: &mut State, order: &[PathBuf]) {
     }
 }
 
-fn remove_entry(state: &mut State, path: &Path) {
+fn remove_entry(state: &mut State, path: &SourceRef) {
     if let Some(entry) = state.cache.remove(path) {
         state.bytes = state.bytes.saturating_sub(entry.bytes);
     }
@@ -1226,7 +1257,7 @@ fn media_bytes(media: &LoadedMedia) -> u64 {
 }
 
 fn same_media(left: &Arc<LoadedMedia>, right: &Arc<LoadedMedia>) -> bool {
-    Arc::ptr_eq(left, right) || left.path == right.path
+    Arc::ptr_eq(left, right) || left.source == right.source
 }
 
 fn same_displayed_list(left: &[Arc<LoadedMedia>], right: &[Arc<LoadedMedia>]) -> bool {
@@ -1243,9 +1274,8 @@ fn same_displayed_list(left: &[Arc<LoadedMedia>], right: &[Arc<LoadedMedia>]) ->
 /// is selected or old pages are still displayed (a spread transition).
 fn foreground_is_current(state: &State) -> bool {
     state.foreground.as_ref().is_some_and(|reservation| {
-        state.foreground_target.as_deref() == Some(reservation.path.as_path())
-            && (state.selected.as_deref() == Some(reservation.path.as_path())
-                || !state.displayed.is_empty())
+        state.foreground_target.as_ref() == Some(&reservation.path)
+            && (state.selected.as_ref() == Some(&reservation.path) || !state.displayed.is_empty())
     })
 }
 
@@ -1270,6 +1300,7 @@ fn rebuild_displayed_identities(state: &mut State, old: &[RememberedEntry]) {
     state.displayed_identities = next;
 }
 
+#[cfg(test)]
 fn absolute(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -1300,31 +1331,8 @@ fn remembered_entry(state: &State, displayed: &Arc<LoadedMedia>) -> Option<Decod
         })
 }
 
-fn readable_identity(path: &Path) -> Option<FileIdentity> {
-    // shortcut: identity is length plus modification time, so a replacement
-    // preserving both (or a symlink retarget with identical metadata) is not
-    // noticed; upgrade to content hashing only if that miss becomes a real
-    // correctness issue, since it would negate the prefetch gain.
-    //
-    // Stat before opening so a FIFO or other special file is not opened while
-    // a background validation runs. The stat/open race remains acceptable.
-    let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    let file = std::fs::File::open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    Some(FileIdentity {
-        len: metadata.len(),
-        modified: metadata.modified().ok()?,
-    })
-}
-
-fn readable_fresh(path: &Path, identity: FileIdentity) -> bool {
-    readable_identity(path) == Some(identity)
+fn readable_fresh(path: &SourceRef, identity: &SourceIdentity) -> bool {
+    source_identity(path).as_ref() == Some(identity)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1341,7 +1349,7 @@ mod tests {
     use std::fs;
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
-    use std::time::Instant;
+    use std::time::{Instant, SystemTime};
 
     struct TempDir(PathBuf);
 
@@ -1370,6 +1378,7 @@ mod tests {
 
     fn media(path: &Path, width: u32, height: u32, frames: usize) -> LoadedMedia {
         LoadedMedia {
+            source: SourceRef::file(path),
             path: absolute(path),
             frames: (0..frames)
                 .map(|_| MediaFrame {
@@ -1404,7 +1413,10 @@ mod tests {
             + Sync
             + 'static,
     {
-        Prefetcher::spawn(settings, Arc::new(decode))
+        Prefetcher::spawn(
+            settings,
+            Arc::new(move |source, cancel, purpose| decode(source.path(), cancel, purpose)),
+        )
     }
 
     fn settings(before: usize, after: usize, memory_mib: u64) -> PrefetchSettings {
@@ -1427,7 +1439,7 @@ mod tests {
         let mut paths: Vec<PathBuf> = lock(&prefetcher.inner.shared.state)
             .cache
             .keys()
-            .cloned()
+            .map(|source| source.path().to_path_buf())
             .collect();
         paths.sort();
         paths
@@ -1472,6 +1484,72 @@ mod tests {
         );
         assert!(neighbor_order(&siblings, None, &settings(2, 2, 1)).is_empty());
         assert!(neighbor_order(&siblings, Some(&selected), &settings(0, 0, 1)).is_empty());
+    }
+
+    #[test]
+    fn archive_entries_have_distinct_cache_keys_and_revalidate_same_path_replacements() {
+        use crate::model::source::{catalog_for, test_support::write_zip};
+        use std::io::Cursor;
+        let dir = TempDir::new();
+        let path = dir.0.join("pages.cbz");
+        let png = |color| {
+            let mut bytes = Cursor::new(Vec::new());
+            RgbaImage::from_pixel(4, 3, Rgba(color))
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            bytes.into_inner()
+        };
+        let red = png([255, 0, 0, 255]);
+        let blue = png([0, 0, 255, 255]);
+        write_zip(&path, &[("a.png", &red), ("b.png", &blue)]);
+        let items = catalog_for(&path).unwrap().items;
+        let prefetch = Prefetcher::new(settings(1, 1, 1));
+        prefetch.update_context_many_sources(items.clone(), Some(items[0].clone()), Vec::new());
+        prefetch.set_allowed(true);
+        wait_until(|| prefetch.stats().entries == 1);
+        prefetch.set_allowed(false);
+        let cancel = AtomicBool::new(false);
+        assert!(prefetch.peek_source(&items[0], &cancel).is_none());
+        let cached = prefetch.peek_source(&items[1], &cancel).unwrap();
+        prefetch.foreground_requested_source(&items[1]);
+        let loaded = prefetch.load_source(&items[1], &cancel).unwrap();
+        assert!(Arc::ptr_eq(&loaded, &cached));
+        assert_eq!(loaded.source, items[1]);
+        assert_eq!(prefetch.stats().hits, 1);
+        // Readmit this delivered page as a neighbor, then change the archive
+        // without changing the entry's central metadata.
+        prefetch.update_context_many_sources(
+            items.clone(),
+            Some(items[1].clone()),
+            vec![loaded.clone()],
+        );
+        let primary = prefetch.load_source(&items[0], &cancel).unwrap();
+        prefetch.update_context_many_sources(items.clone(), Some(items[0].clone()), vec![primary]);
+        assert_eq!(prefetch.stats().entries, 1);
+        let old = source_identity(&items[1]).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old.modified + Duration::from_secs(5))
+            .unwrap();
+        assert!(prefetch.peek_source(&items[1], &cancel).is_none());
+        let fresh = prefetch.load_source(&items[1], &cancel).unwrap();
+        assert!(!Arc::ptr_eq(&loaded, &fresh));
+        assert_eq!(
+            prefetch.stats().hits,
+            1,
+            "stale archive cache was not a hit"
+        );
+        write_zip(&path, &[("a.png", &red), ("b.png", &red)]);
+        assert!(prefetch.load_source(&items[1], &cancel).is_err());
+        let new_items = catalog_for(&path).unwrap().items;
+        let changed = prefetch.load_source(&new_items[1], &cancel).unwrap();
+        assert_eq!(
+            *changed.frames[0].pixels.get_pixel(0, 0),
+            Rgba([255, 0, 0, 255])
+        );
+        prefetch.shutdown();
     }
 
     #[test]
@@ -1577,7 +1655,7 @@ mod tests {
         prefetcher.set_allowed(false);
         let cached = lock(&prefetcher.inner.shared.state)
             .cache
-            .get(&b)
+            .get(&SourceRef::file(&b))
             .map(|entry| Arc::clone(&entry.decoded.media))
             .expect("cached neighbor");
 
@@ -1611,7 +1689,7 @@ mod tests {
         prefetcher.set_allowed(false);
         let cached = lock(&prefetcher.inner.shared.state)
             .cache
-            .get(&b)
+            .get(&SourceRef::file(&b))
             .map(|entry| Arc::clone(&entry.decoded.media))
             .expect("cached neighbor");
 
@@ -1918,7 +1996,7 @@ mod tests {
         prefetcher.set_allowed(false);
         let cached = lock(&prefetcher.inner.shared.state)
             .cache
-            .get(&b)
+            .get(&SourceRef::file(&b))
             .map(|entry| Arc::clone(&entry.decoded.media))
             .expect("cached neighbor");
 
@@ -1965,8 +2043,8 @@ mod tests {
         let (cached_b, cached_d) = {
             let state = lock(&prefetcher.inner.shared.state);
             (
-                Arc::clone(&state.cache[&b].decoded.media),
-                Arc::clone(&state.cache[&d].decoded.media),
+                Arc::clone(&state.cache[&SourceRef::file(&b)].decoded.media),
+                Arc::clone(&state.cache[&SourceRef::file(&d)].decoded.media),
             )
         };
 
@@ -2008,7 +2086,7 @@ mod tests {
         prefetcher.set_allowed(true);
         wait_until(|| prefetcher.stats().entries == 1);
         prefetcher.set_allowed(false);
-        let cached = lock(&prefetcher.inner.shared.state).cache[&b]
+        let cached = lock(&prefetcher.inner.shared.state).cache[&SourceRef::file(&b)]
             .decoded
             .media
             .clone();
@@ -2026,7 +2104,7 @@ mod tests {
         prefetcher.set_allowed(true);
         wait_until(|| prefetcher.stats().entries == 1);
         prefetcher.set_allowed(false);
-        let cached = lock(&prefetcher.inner.shared.state).cache[&b]
+        let cached = lock(&prefetcher.inner.shared.state).cache[&SourceRef::file(&b)]
             .decoded
             .media
             .clone();
@@ -2278,16 +2356,16 @@ mod tests {
         let dir = TempDir::new();
         let a = dir.file("a.png");
         let b = dir.file("b.png");
-        let identity = readable_identity(&b).unwrap();
+        let identity = source_identity(&SourceRef::file(&b)).unwrap();
         let build = || {
             let mut state = State::new(settings(1, 1, 1));
-            state.siblings = vec![a.clone(), b.clone()];
-            state.selected = Some(a.clone());
+            state.siblings = vec![SourceRef::file(&a), SourceRef::file(&b)];
+            state.selected = Some(SourceRef::file(&a));
             state.inflight = Some(Inflight {
                 job: Job {
                     id: 9,
                     epoch: 5,
-                    path: b.clone(),
+                    path: SourceRef::file(&b),
                     purpose: DecodePurpose::Animated,
                     cancel: Arc::new(AtomicBool::new(false)),
                 },
@@ -2295,7 +2373,7 @@ mod tests {
                 promoted: false,
                 done: Some(Ok(DecodedEntry {
                     media: Arc::new(media(&b, 10, 10, 1)),
-                    identity,
+                    identity: identity.clone(),
                     purpose: DecodePurpose::Animated,
                 })),
             });
@@ -2305,7 +2383,10 @@ mod tests {
         let mut same_epoch = build();
         same_epoch.epoch = 5;
         detach(&mut same_epoch, 9, false);
-        assert!(same_epoch.cache.contains_key(&b), "eligible at done epoch");
+        assert!(
+            same_epoch.cache.contains_key(&SourceRef::file(&b)),
+            "eligible at done epoch"
+        );
 
         let mut next_epoch = build();
         next_epoch.epoch = 6;
@@ -2634,7 +2715,7 @@ mod tests {
         let (cached_path, cached_media) = {
             let state = lock(&prefetcher.inner.shared.state);
             let (path, entry) = state.cache.iter().next().expect("cached neighbor");
-            (path.clone(), Arc::clone(&entry.decoded.media))
+            (path.path().to_path_buf(), Arc::clone(&entry.decoded.media))
         };
         let hits_before = prefetcher.stats().hits;
         prefetcher.foreground_requested(&cached_path);
@@ -2728,14 +2809,15 @@ mod tests {
         let prefetcher = with_fake(settings(1, 1, 1), fixed(10, 10, 1));
         prefetcher.set_allowed(false);
         let fifo_media = Arc::new(media(&fifo, 10, 10, 1));
-        let identity = FileIdentity {
+        let identity = SourceIdentity {
             len: 1,
             modified: SystemTime::UNIX_EPOCH,
+            entry: None,
         };
         {
             let mut state = lock(&prefetcher.inner.shared.state);
-            state.siblings = vec![fifo.clone(), other.clone()];
-            state.selected = Some(other.clone());
+            state.siblings = vec![SourceRef::file(&fifo), SourceRef::file(&other)];
+            state.selected = Some(SourceRef::file(&other));
             state.displayed = vec![Arc::clone(&fifo_media)];
             state.trusted = Some(RememberedEntry::from_entry(&DecodedEntry {
                 media: Arc::clone(&fifo_media),
@@ -2779,7 +2861,7 @@ mod tests {
         prefetcher.set_allowed(true);
         wait_until(|| prefetcher.stats().entries == 1);
         assert_eq!(
-            lock(&prefetcher.inner.shared.state).cache[&b]
+            lock(&prefetcher.inner.shared.state).cache[&SourceRef::file(&b)]
                 .decoded
                 .media
                 .frames
@@ -3019,8 +3101,8 @@ mod tests {
         let (b_cached, c_cached) = {
             let state = lock(&prefetcher.inner.shared.state);
             (
-                Arc::clone(&state.cache[&siblings[1]].decoded.media),
-                Arc::clone(&state.cache[&siblings[2]].decoded.media),
+                Arc::clone(&state.cache[&SourceRef::file(&siblings[1])].decoded.media),
+                Arc::clone(&state.cache[&SourceRef::file(&siblings[2])].decoded.media),
             )
         };
 
@@ -3088,12 +3170,12 @@ mod tests {
         assert!(
             !lock(&prefetcher.inner.shared.state)
                 .cache
-                .contains_key(&siblings[2])
+                .contains_key(&SourceRef::file(&siblings[2]))
         );
         assert!(
             !lock(&prefetcher.inner.shared.state)
                 .cache
-                .contains_key(&siblings[3])
+                .contains_key(&SourceRef::file(&siblings[3]))
         );
 
         // Two forward slots start after the second visible page, so the
@@ -3139,8 +3221,14 @@ mod tests {
             "both former visible pages re-enter outside the new span"
         );
         let state = lock(&prefetcher.inner.shared.state);
-        assert!(Arc::ptr_eq(&state.cache[&siblings[2]].decoded.media, &c));
-        assert!(Arc::ptr_eq(&state.cache[&siblings[3]].decoded.media, &d));
+        assert!(Arc::ptr_eq(
+            &state.cache[&SourceRef::file(&siblings[2])].decoded.media,
+            &c
+        ));
+        assert!(Arc::ptr_eq(
+            &state.cache[&SourceRef::file(&siblings[3])].decoded.media,
+            &d
+        ));
     }
 
     #[test]
@@ -3221,7 +3309,7 @@ mod tests {
         });
         let e_cached = {
             let state = lock(&prefetcher.inner.shared.state);
-            Arc::clone(&state.cache[&e].decoded.media)
+            Arc::clone(&state.cache[&SourceRef::file(&e)].decoded.media)
         };
         prefetcher.set_allowed(false);
 
@@ -3243,7 +3331,7 @@ mod tests {
         {
             let state = lock(&prefetcher.inner.shared.state);
             let reservation = state.foreground.as_ref().expect("new E reservation");
-            assert_eq!(reservation.path, e);
+            assert_eq!(reservation.path, SourceRef::file(&e));
             assert!(Arc::ptr_eq(&reservation.decoded.media, &e_cached));
         }
 
@@ -3256,7 +3344,7 @@ mod tests {
         {
             let state = lock(&prefetcher.inner.shared.state);
             let reservation = state.foreground.as_ref().expect("E reservation survives");
-            assert_eq!(reservation.path, e);
+            assert_eq!(reservation.path, SourceRef::file(&e));
             assert!(Arc::ptr_eq(&reservation.decoded.media, &e_cached));
         }
 
@@ -3289,7 +3377,7 @@ mod tests {
         });
         let c_cached = {
             let state = lock(&prefetcher.inner.shared.state);
-            Arc::clone(&state.cache[&c].decoded.media)
+            Arc::clone(&state.cache[&SourceRef::file(&c)].decoded.media)
         };
         prefetcher.set_allowed(false);
 
@@ -3367,7 +3455,7 @@ mod tests {
         let before = prefetcher.stats();
         let cached = {
             let state = lock(&prefetcher.inner.shared.state);
-            Arc::clone(&state.cache[&b].decoded.media)
+            Arc::clone(&state.cache[&SourceRef::file(&b)].decoded.media)
         };
 
         let cancel = AtomicBool::new(false);
@@ -3380,7 +3468,11 @@ mod tests {
             (after.entries, after.bytes, after.hits),
             (before.entries, before.bytes, before.hits)
         );
-        assert!(lock(&prefetcher.inner.shared.state).cache.contains_key(&b));
+        assert!(
+            lock(&prefetcher.inner.shared.state)
+                .cache
+                .contains_key(&SourceRef::file(&b))
+        );
 
         prefetcher.set_allowed(false);
         prefetcher.foreground_requested(&b);

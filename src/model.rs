@@ -5,7 +5,7 @@
 //! a decoder can trust their declared sizes. These are per-image bounds, not a
 //! whole-process memory guarantee.
 
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,6 +16,12 @@ use image::codecs::gif::GifDecoder;
 use image::metadata::Orientation;
 use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageReader, Limits, RgbaImage};
 
+// Kept here until the UI switches its root module declarations to virtual sources.
+#[path = "source.rs"]
+#[allow(dead_code)] // C1a API; catalog and dimension consumers arrive with the UI switch.
+pub mod source;
+use source::{SourceRef, read_source_bytes};
+
 /// Extensions the viewer advertises and lists next to the current image.
 const SUPPORTED_EXTENSIONS: [&str; 9] = [
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff",
@@ -23,10 +29,10 @@ const SUPPORTED_EXTENSIONS: [&str; 9] = [
 
 /// Largest accepted source image side before CPU budgets apply. GIF logical
 /// screens are u16-sized; static images keep the same checked bound.
-const MAX_SOURCE_SIDE: u32 = 65_535;
+pub(crate) const MAX_SOURCE_SIDE: u32 = 65_535;
 /// Largest accepted decoded buffer in bytes. The RGBA copy is bounded by the
 /// same value, so peak use is roughly twice this (plus one rotation copy).
-const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
 /// Total RGBA bytes retained for one animation. Exceeding it rejects the whole
 /// animation instead of silently truncating it.
 const MAX_ANIMATION_BYTES: u64 = MAX_DECODED_BYTES;
@@ -36,7 +42,7 @@ const MAX_GIF_FRAMES: usize = 2_048;
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(10);
 /// Largest encoded file read into memory. Some decoders copy the whole input
 /// before honoring their own limits, so this is enforced before decoding.
-const MAX_ENCODED_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_ENCODED_BYTES: u64 = 256 * 1024 * 1024;
 
 /// How many times an animation repeats after its first play-through.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -69,6 +75,7 @@ pub struct MediaFrame {
 /// A static image or bounded GIF animation.
 #[derive(Debug)]
 pub struct LoadedMedia {
+    pub source: SourceRef,
     pub path: PathBuf,
     pub frames: Vec<MediaFrame>,
     pub loop_mode: LoopMode,
@@ -151,14 +158,9 @@ fn decode_static_bytes(absolute: &Path, bytes: Vec<u8>) -> Result<LoadedImage, S
 /// frame in [`LoopMode::Once`]. GIF frames are decoded sequentially
 /// with the image compositor and checked against the retained-RGBA and
 /// frame-count budgets.
+#[allow(dead_code)] // Retained Path compatibility API.
 pub fn load_media(path: &Path, cancel: &AtomicBool) -> Result<LoadedMedia, String> {
-    load_media_with_limits(
-        path,
-        cancel,
-        MAX_ENCODED_BYTES,
-        MAX_GIF_FRAMES,
-        MAX_ANIMATION_BYTES,
-    )
+    load_media_for(path, cancel, DecodePurpose::Animated)
 }
 
 /// Loads `path` according to how the caller will display it.
@@ -166,73 +168,81 @@ pub fn load_media(path: &Path, cancel: &AtomicBool) -> Result<LoadedMedia, Strin
 /// [`DecodePurpose::Animated`] is identical to [`load_media`]. `Still` always
 /// returns one zero-delay [`LoopMode::Once`] frame; animated GIFs decode only
 /// their first composited logical screen, reusing the bounded static decoder.
+#[allow(dead_code)] // Retained Path compatibility API.
 pub fn load_media_for(
     path: &Path,
     cancel: &AtomicBool,
     purpose: DecodePurpose,
 ) -> Result<LoadedMedia, String> {
-    match purpose {
-        DecodePurpose::Animated => load_media(path, cancel),
-        DecodePurpose::Still => load_still_media(path, cancel),
-    }
+    load_media_for_source(&SourceRef::file(path), cancel, purpose)
 }
 
-fn load_still_media(path: &Path, cancel: &AtomicBool) -> Result<LoadedMedia, String> {
-    let absolute = resolve_supported(path)?;
-    if cancelled(cancel) {
-        return Err(format!("{}: cancelled", absolute.display()));
-    }
-    let bytes = read_encoded(&absolute, MAX_ENCODED_BYTES)?;
-    let loaded = decode_static_bytes(&absolute, bytes)?;
-    if cancelled(cancel) {
-        return Err(format!("{}: cancelled", absolute.display()));
-    }
-    Ok(still_media(loaded))
-}
-
-fn still_media(loaded: LoadedImage) -> LoadedMedia {
-    LoadedMedia {
-        path: loaded.path,
-        frames: vec![MediaFrame {
-            pixels: Arc::new(loaded.pixels),
-            delay: Duration::ZERO,
-        }],
-        loop_mode: LoopMode::Once,
-    }
-}
-
-fn load_media_with_limits(
-    path: &Path,
+pub fn load_media_for_source(
+    source: &SourceRef,
     cancel: &AtomicBool,
+    purpose: DecodePurpose,
+) -> Result<LoadedMedia, String> {
+    load_source_with_limits(
+        source,
+        cancel,
+        purpose,
+        MAX_ENCODED_BYTES,
+        MAX_GIF_FRAMES,
+        MAX_ANIMATION_BYTES,
+    )
+}
+
+fn load_source_with_limits(
+    source: &SourceRef,
+    cancel: &AtomicBool,
+    purpose: DecodePurpose,
     encoded_limit: u64,
     max_frames: usize,
     max_animation_bytes: u64,
 ) -> Result<LoadedMedia, String> {
-    let absolute = resolve_supported(path)?;
+    let source = match source {
+        SourceRef::File(path) => SourceRef::File(resolve_supported(path)?),
+        source => source.clone(),
+    };
     if cancelled(cancel) {
-        return Err(format!("{}: cancelled", absolute.display()));
+        return Err(format!("{source}: cancelled"));
     }
-    let bytes = read_encoded(&absolute, encoded_limit)?;
+    let bytes = read_source_bytes(&source, encoded_limit)?;
+    let result = decode_media_bytes(
+        &source,
+        bytes,
+        cancel,
+        purpose,
+        max_frames,
+        max_animation_bytes,
+    );
+    result.map_err(|err| format!("{source}: {err}"))
+}
 
-    // Dispatch on content, not extension: a GIF named .png must animate, and a
-    // PNG/JPEG named .gif must remain static. The extension filter above still
-    // rejects unsupported names.
+fn decode_media_bytes(
+    source: &SourceRef,
+    bytes: Vec<u8>,
+    cancel: &AtomicBool,
+    purpose: DecodePurpose,
+    max_frames: usize,
+    max_animation_bytes: u64,
+) -> Result<LoadedMedia, String> {
+    let absolute = source.path();
     let is_gif = matches!(image::guess_format(&bytes), Ok(image::ImageFormat::Gif));
-    if !is_gif {
-        let loaded = decode_static_bytes(&absolute, bytes)?;
+    if purpose == DecodePurpose::Still || !is_gif {
+        let loaded = decode_static_bytes(absolute, bytes)?;
         if cancelled(cancel) {
-            return Err(format!("{}: cancelled", absolute.display()));
+            return Err(format!("{source}: cancelled"));
         }
-        return Ok(still_media(loaded));
+        return Ok(still_media(loaded, source.clone()));
     }
-
     let (loop_mode, expected_frames) =
         preflight_gif(&bytes, cancel, max_frames, max_animation_bytes)
             .map_err(|err| format!("{}: {err}", absolute.display()))?;
     let frames = decode_gif_frames(
         bytes,
         cancel,
-        &absolute,
+        absolute,
         expected_frames,
         max_frames,
         max_animation_bytes,
@@ -243,10 +253,41 @@ fn load_media_with_limits(
         return Err(format!("{}: cancelled", absolute.display()));
     }
     Ok(LoadedMedia {
-        path: absolute,
+        source: source.clone(),
+        path: absolute.to_path_buf(),
         frames,
         loop_mode,
     })
+}
+
+fn still_media(loaded: LoadedImage, source: SourceRef) -> LoadedMedia {
+    LoadedMedia {
+        source,
+        path: loaded.path,
+        frames: vec![MediaFrame {
+            pixels: Arc::new(loaded.pixels),
+            delay: Duration::ZERO,
+        }],
+        loop_mode: LoopMode::Once,
+    }
+}
+
+#[cfg(test)]
+fn load_media_with_limits(
+    path: &Path,
+    cancel: &AtomicBool,
+    encoded_limit: u64,
+    max_frames: usize,
+    max_animation_bytes: u64,
+) -> Result<LoadedMedia, String> {
+    load_source_with_limits(
+        &SourceRef::file(path),
+        cancel,
+        DecodePurpose::Animated,
+        encoded_limit,
+        max_frames,
+        max_animation_bytes,
+    )
 }
 
 fn resolve_supported(path: &Path) -> Result<PathBuf, String> {
@@ -273,24 +314,9 @@ fn cancelled(cancel: &AtomicBool) -> bool {
 }
 
 /// Reads at most `limit` bytes, so a decoder cannot copy an unbounded file.
+#[cfg(test)]
 fn read_encoded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|err| format!("cannot open {}: {err}", path.display()))?;
-    let capacity = file
-        .metadata()
-        .map(|metadata| metadata.len().min(limit.saturating_add(1)))
-        .unwrap_or(0);
-    let mut bytes = Vec::with_capacity(usize::try_from(capacity).unwrap_or(0));
-    file.take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-    if bytes.len() as u64 > limit {
-        return Err(format!(
-            "{}: encoded file is larger than {limit} bytes",
-            path.display()
-        ));
-    }
-    Ok(bytes)
+    read_source_bytes(&SourceRef::file(path), limit)
 }
 
 /// Reads the loop extension and counts frames without decoding LZW pixels.
@@ -449,7 +475,7 @@ fn decode_gif_frames(
 /// slightly past the declared RIFF size; its EXIF accessor later allocates the
 /// recorded range. Every chunk, including ANMF frame chunks, must therefore be
 /// contained in the declared data before decoder construction.
-fn validate_webp_chunks(bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn validate_webp_chunks(bytes: &[u8]) -> Result<(), String> {
     if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
         return Ok(());
     }
@@ -605,7 +631,10 @@ pub fn supported_path(path: &Path) -> bool {
 }
 
 /// The dimensions after an EXIF transform swaps the axes.
-fn oriented_dimensions((width, height): (u32, u32), orientation: Orientation) -> (u32, u32) {
+pub(crate) fn oriented_dimensions(
+    (width, height): (u32, u32),
+    orientation: Orientation,
+) -> (u32, u32) {
     match orientation {
         Orientation::Rotate90
         | Orientation::Rotate270
@@ -616,7 +645,7 @@ fn oriented_dimensions((width, height): (u32, u32), orientation: Orientation) ->
 }
 
 /// Rejects empty images and images whose RGBA buffer would blow the budget.
-fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
+pub(crate) fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
     if width == 0 || height == 0 {
         return Err("image has zero width or height".to_owned());
     }
@@ -1011,6 +1040,70 @@ mod tests {
         assert_eq!(media.frames[0].pixels.as_ref(), &pixels);
         assert!(
             load_media(&path, &AtomicBool::new(true))
+                .unwrap_err()
+                .contains("cancelled")
+        );
+    }
+
+    #[test]
+    fn archive_media_reuses_still_animation_orientation_and_cancellation() {
+        use source::{catalog_for, probe_dimensions, test_support::write_zip};
+        let dir = TempDir::new();
+        let path = dir.path().join("pages.cbz");
+        let mut png = Cursor::new(Vec::new());
+        sample_pixels()
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let gif = encode_gif(4, 2, None, &[full_red_frame(), full_red_frame()]);
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode_image(&sample_pixels())
+            .unwrap();
+        let jpeg = with_exif_orientation(jpeg, 6);
+        let webp_path = dir.path().join("input.webp");
+        let simple = write_rgb_webp(&webp_path, 16, 8);
+        let webp = webp_with_exif(&simple, &exif_tiff(6), 16, 8);
+        write_zip(
+            &path,
+            &[
+                ("a.png", png.get_ref()),
+                ("b.gif", &gif),
+                ("c.jpg", &jpeg),
+                ("d.webp", &webp),
+            ],
+        );
+        let items = catalog_for(&path).unwrap().items;
+        let cancel = AtomicBool::new(false);
+        let still = load_media_for_source(&items[0], &cancel, DecodePurpose::Still).unwrap();
+        assert_eq!(still.source, items[0]);
+        assert_eq!(still.path, path);
+        assert_eq!(still.frames[0].pixels.as_ref(), &sample_pixels());
+        assert_eq!(
+            probe_dimensions(&items[0], MAX_ENCODED_BYTES).unwrap(),
+            (3, 2)
+        );
+        let animated = load_media_for_source(&items[1], &cancel, DecodePurpose::Animated).unwrap();
+        let first = load_media_for_source(&items[1], &cancel, DecodePurpose::Still).unwrap();
+        assert_eq!(animated.frames.len(), 2);
+        assert_eq!(first.frames.len(), 1);
+        assert_eq!(first.frames[0].pixels, animated.frames[0].pixels);
+        for (source, dimensions) in items[2..].iter().zip([(2, 3), (8, 16)]) {
+            assert_eq!(
+                probe_dimensions(source, MAX_ENCODED_BYTES).unwrap(),
+                dimensions
+            );
+            assert_eq!(
+                load_media_for_source(source, &cancel, DecodePurpose::Still)
+                    .unwrap()
+                    .frames[0]
+                    .pixels
+                    .dimensions(),
+                dimensions
+            );
+        }
+        assert!(probe_dimensions(&items[0], 1).is_err());
+        assert!(
+            load_media_for_source(&items[0], &AtomicBool::new(true), DecodePurpose::Still)
                 .unwrap_err()
                 .contains("cancelled")
         );

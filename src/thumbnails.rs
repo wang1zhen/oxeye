@@ -21,11 +21,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use image::RgbaImage;
 
-use crate::model::{DecodePurpose, LoadedMedia, load_media_for};
+use crate::model::source::{SourceIdentity, SourceRef, source_identity};
+use crate::model::{DecodePurpose, LoadedMedia, load_media_for_source};
 use crate::preload::Prefetcher;
 
 /// Longest thumbnail side, before aspect-ratio fitting.
@@ -41,27 +42,20 @@ const WORKER_TICK: Duration = Duration::from_millis(100);
 
 /// Injected decode function, replaced by deterministic fakes in tests.
 type DecodeFn =
-    dyn Fn(&Path, &AtomicBool, DecodePurpose) -> Result<LoadedMedia, String> + Send + Sync;
-
-/// Cheap identity of one file version, checked by the worker before admission.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileIdentity {
-    len: u64,
-    modified: SystemTime,
-}
+    dyn Fn(&SourceRef, &AtomicBool, DecodePurpose) -> Result<LoadedMedia, String> + Send + Sync;
 
 struct CacheEntry {
     pixels: Arc<RgbaImage>,
     bytes: u64,
     last_used: u64,
-    identity: FileIdentity,
+    identity: SourceIdentity,
     /// Context epoch in which this entry was freshly validated or admitted.
     validated_epoch: u64,
 }
 
 /// LRU cache charged in actual RGBA bytes.
 struct Cache {
-    entries: HashMap<PathBuf, CacheEntry>,
+    entries: HashMap<SourceRef, CacheEntry>,
     bytes: u64,
     budget: u64,
     clock: u64,
@@ -79,7 +73,7 @@ impl Cache {
 
     /// Returns a cached thumbnail only when the current context epoch has
     /// validated it. Retained pixels may still be reused after validation.
-    fn get(&mut self, path: &Path, epoch: u64) -> Option<Arc<RgbaImage>> {
+    fn get(&mut self, path: &SourceRef, epoch: u64) -> Option<Arc<RgbaImage>> {
         let entry = self.entries.get_mut(path)?;
         if entry.validated_epoch != epoch {
             return None;
@@ -90,7 +84,7 @@ impl Cache {
     }
 
     /// Marks a retained entry valid for `epoch`. Returns whether it changed.
-    fn mark_validated(&mut self, path: &Path, epoch: u64) -> bool {
+    fn mark_validated(&mut self, path: &SourceRef, epoch: u64) -> bool {
         let entry = self.entries.get_mut(path);
         match entry {
             Some(entry) if entry.validated_epoch != epoch => {
@@ -101,11 +95,11 @@ impl Cache {
         }
     }
 
-    fn identity(&self, path: &Path) -> Option<FileIdentity> {
-        self.entries.get(path).map(|entry| entry.identity)
+    fn identity(&self, path: &SourceRef) -> Option<SourceIdentity> {
+        self.entries.get(path).map(|entry| entry.identity.clone())
     }
 
-    fn remove(&mut self, path: &Path) -> bool {
+    fn remove(&mut self, path: &SourceRef) -> bool {
         let Some(entry) = self.entries.remove(path) else {
             return false;
         };
@@ -122,10 +116,10 @@ impl Cache {
     /// Returns whether the path stayed cached and how many entries were evicted.
     fn insert(
         &mut self,
-        path: PathBuf,
-        identity: FileIdentity,
+        path: SourceRef,
+        identity: SourceIdentity,
         pixels: Arc<RgbaImage>,
-        visible: &[PathBuf],
+        visible: &[SourceRef],
         validated_epoch: u64,
     ) -> (bool, usize) {
         let bytes = pixels.as_raw().len() as u64;
@@ -152,7 +146,7 @@ impl Cache {
         (self.entries.contains_key(&path), evicted)
     }
 
-    fn evict_until(&mut self, visible: &[PathBuf]) -> usize {
+    fn evict_until(&mut self, visible: &[SourceRef]) -> usize {
         let mut evicted = 0;
         while self.bytes > self.budget || self.entries.len() > MAX_CACHE_ENTRIES {
             let victim = self
@@ -176,12 +170,12 @@ impl Cache {
 }
 
 struct State {
-    visible: Vec<PathBuf>,
+    visible: Vec<SourceRef>,
     generation: u64,
     epoch: u64,
     allowed: bool,
     cancel: Arc<AtomicBool>,
-    failed: HashSet<PathBuf>,
+    failed: HashSet<SourceRef>,
     cache: Cache,
 }
 
@@ -231,7 +225,11 @@ pub struct Thumbnails {
 impl Thumbnails {
     /// Starts the bounded thumbnail worker.
     pub fn new(prefetch: Prefetcher) -> Self {
-        Self::spawn(prefetch, Arc::new(load_media_for), CACHE_BUDGET_BYTES)
+        Self::spawn(
+            prefetch,
+            Arc::new(load_media_for_source),
+            CACHE_BUDGET_BYTES,
+        )
     }
 
     fn spawn(prefetch: Prefetcher, decode: Arc<DecodeFn>, budget: u64) -> Self {
@@ -271,6 +269,13 @@ impl Thumbnails {
     /// worker or starve a path. An empty set clears the CPU cache and cancels
     /// the current job.
     pub fn set_visible(&self, paths: Vec<PathBuf>, generation: u64) {
+        self.set_visible_sources(
+            paths.iter().map(|path| SourceRef::file(path)).collect(),
+            generation,
+        );
+    }
+
+    pub fn set_visible_sources(&self, paths: Vec<SourceRef>, generation: u64) {
         let mut state = lock(&self.inner.state);
         if state.visible == paths && state.generation == generation {
             return;
@@ -319,9 +324,13 @@ impl Thumbnails {
     /// no decode. A missing or not-yet-current-epoch entry is `None`; the UI
     /// draws its placeholder.
     pub fn get(&self, path: &Path) -> Option<Arc<RgbaImage>> {
+        self.get_source(&SourceRef::file(path))
+    }
+
+    pub fn get_source(&self, source: &SourceRef) -> Option<Arc<RgbaImage>> {
         let mut state = lock(&self.inner.state);
         let epoch = state.epoch;
-        state.cache.get(path, epoch)
+        state.cache.get(source, epoch)
     }
 
     /// Increases whenever the UI may need a new display: success, invalid file,
@@ -346,7 +355,11 @@ impl Thumbnails {
             + Sync
             + 'static,
     {
-        Self::spawn(prefetch, Arc::new(decode), budget)
+        Self::spawn(
+            prefetch,
+            Arc::new(move |source, cancel, purpose| decode(source.path(), cancel, purpose)),
+            budget,
+        )
     }
 
     #[cfg(test)]
@@ -399,14 +412,14 @@ fn run(weak: Weak<Inner>) {
 }
 
 /// Processes one visible path. Returns whether its index can advance.
-fn process_one(inner: &Arc<Inner>, path: &Path, epoch: u64, cancel: &AtomicBool) -> bool {
+fn process_one(inner: &Arc<Inner>, path: &SourceRef, epoch: u64, cancel: &AtomicBool) -> bool {
     if cancel.load(Ordering::Relaxed) || !inner.is_current(epoch) {
         return false;
     }
 
     // Snapshot before any decode so a changed file is not admitted with old
     // pixels. Unreadable or non-regular files fail this epoch's placeholder.
-    let Some(identity) = snapshot(path) else {
+    let Some(identity) = source_identity(path) else {
         lock(&inner.state).cache.remove(path);
         return fail(inner, path, epoch);
     };
@@ -447,7 +460,7 @@ fn process_one(inner: &Arc<Inner>, path: &Path, epoch: u64, cancel: &AtomicBool)
 
     // Borrow a non-consuming prefetch result first. `peek` neither consumes the
     // entry nor counts a hit; the core prefetcher keeps its cache accounting.
-    let media = match inner.prefetch.peek(path, cancel) {
+    let media = match inner.prefetch.peek_source(path, cancel) {
         Some(media) => media,
         None => match (inner.decode)(path, cancel, DecodePurpose::Still) {
             Ok(media) => Arc::new(media),
@@ -473,7 +486,7 @@ fn process_one(inner: &Arc<Inner>, path: &Path, epoch: u64, cancel: &AtomicBool)
     // never keep one per thumbnail path.
     drop(media);
 
-    if snapshot(path) != Some(identity) {
+    if source_identity(path).as_ref() != Some(&identity) {
         return fail(inner, path, epoch);
     }
     if cancel.load(Ordering::Relaxed) || !inner.is_current(epoch) {
@@ -483,12 +496,12 @@ fn process_one(inner: &Arc<Inner>, path: &Path, epoch: u64, cancel: &AtomicBool)
     admit(inner, path, epoch, identity, pixels)
 }
 
-fn fail(inner: &Inner, path: &Path, epoch: u64) -> bool {
+fn fail(inner: &Inner, path: &SourceRef, epoch: u64) -> bool {
     let mut state = lock(&inner.state);
     let current = state.epoch == epoch;
     if current {
         // One placeholder per epoch: a bad source is not retried forever.
-        state.failed.insert(path.to_path_buf());
+        state.failed.insert(path.clone());
     }
     drop(state);
     if current {
@@ -499,9 +512,9 @@ fn fail(inner: &Inner, path: &Path, epoch: u64) -> bool {
 
 fn admit(
     inner: &Inner,
-    path: &Path,
+    path: &SourceRef,
     epoch: u64,
-    identity: FileIdentity,
+    identity: SourceIdentity,
     pixels: RgbaImage,
 ) -> bool {
     let mut state = lock(&inner.state);
@@ -510,37 +523,13 @@ fn admit(
     }
     let (admitted, evicted) = {
         let State { cache, visible, .. } = &mut *state;
-        cache.insert(
-            path.to_path_buf(),
-            identity,
-            Arc::new(pixels),
-            visible,
-            epoch,
-        )
+        cache.insert(path.clone(), identity, Arc::new(pixels), visible, epoch)
     };
     drop(state);
     if admitted || evicted > 0 {
         inner.bump_revision();
     }
     true
-}
-
-/// Reads a cheap, readable regular-file identity. The stat/open race remains
-/// acceptable: a later snapshot must match before admission.
-fn snapshot(path: &Path) -> Option<FileIdentity> {
-    let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    let file = std::fs::File::open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    Some(FileIdentity {
-        len: metadata.len(),
-        modified: metadata.modified().ok()?,
-    })
 }
 
 /// Fits an RGBA frame into 160x120, preserving aspect ratio and never upscaling.
@@ -640,6 +629,7 @@ mod tests {
 
     fn media(path: &Path, width: u32, height: u32) -> LoadedMedia {
         LoadedMedia {
+            source: SourceRef::file(path),
             path: path.to_path_buf(),
             frames: vec![MediaFrame {
                 pixels: Arc::new(RgbaImage::from_pixel(
@@ -690,6 +680,50 @@ mod tests {
         assert_eq!(thumbnail(&wide).dimensions(), (160, 16));
         let small = RgbaImage::new(80, 60);
         assert_eq!(thumbnail(&small).dimensions(), (80, 60));
+    }
+
+    #[test]
+    fn archive_thumbnails_are_keyed_by_entry_and_revalidate_on_context_change() {
+        use crate::model::source::{catalog_for, test_support::write_zip};
+        use std::io::Cursor;
+        let dir = TempDir::new();
+        let path = dir.0.join("pages.cbz");
+        let png = |width, height| {
+            let mut bytes = Cursor::new(Vec::new());
+            RgbaImage::from_pixel(width, height, Rgba([10, 20, 30, 255]))
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            bytes.into_inner()
+        };
+        let wide = png(400, 200);
+        let tall = png(200, 400);
+        write_zip(&path, &[("a.png", &wide), ("b.png", &tall)]);
+        let items = catalog_for(&path).unwrap().items;
+        let thumbs = Thumbnails::new(empty_prefetch());
+        thumbs.set_visible_sources(items.clone(), 1);
+        wait_until(|| {
+            thumbs.get_source(&items[0]).is_some() && thumbs.get_source(&items[1]).is_some()
+        });
+        assert_eq!(
+            thumbs.get_source(&items[0]).unwrap().dimensions(),
+            (160, 80)
+        );
+        assert_eq!(
+            thumbs.get_source(&items[1]).unwrap().dimensions(),
+            (60, 120)
+        );
+        thumbs.set_allowed(false);
+        write_zip(&path, &[("a.png", &tall), ("b.png", &tall)]);
+        let changed = catalog_for(&path).unwrap().items;
+        thumbs.set_visible_sources(changed.clone(), 2);
+        assert!(thumbs.get_source(&changed[0]).is_none());
+        thumbs.set_allowed(true);
+        wait_until(|| thumbs.get_source(&changed[0]).is_some());
+        assert_eq!(
+            thumbs.get_source(&changed[0]).unwrap().dimensions(),
+            (60, 120)
+        );
+        thumbs.shutdown();
     }
 
     #[test]
@@ -777,6 +811,7 @@ mod tests {
             let pixels = Arc::new(RgbaImage::from_pixel(640, 480, Rgba([1, 2, 3, 255])));
             *slot.lock().expect("weak slot") = Some(Arc::downgrade(&pixels));
             Ok(LoadedMedia {
+                source: SourceRef::file(path),
                 path: path.to_path_buf(),
                 frames: vec![MediaFrame {
                     pixels,
