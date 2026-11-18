@@ -66,6 +66,8 @@ struct Job {
     path: SourceRef,
     purpose: DecodePurpose,
     cancel: Arc<AtomicBool>,
+    /// `forget_paths` invalidated this decode; its result must never be published.
+    forgotten: bool,
 }
 
 /// The single decode currently running.
@@ -489,6 +491,57 @@ impl Prefetcher {
         Some(frame.pixels.dimensions())
     }
 
+    /// Drops cached pixels, dimension hints and non-owning identities for `paths`.
+    ///
+    /// Used after overwriting a file: without this, Book layout and previews
+    /// keep the old dimensions. The UI's displayed `Arc` is left alone; the
+    /// caller re-decodes and replaces it.
+    pub fn forget_paths(&self, paths: &[SourceRef]) {
+        let mut state = lock(&self.inner.shared.state);
+        for path in paths {
+            if let Some(entry) = state.cache.remove(path) {
+                state.bytes = state.bytes.saturating_sub(entry.bytes);
+            }
+            state.failed.remove(path);
+            if state
+                .foreground
+                .as_ref()
+                .is_some_and(|reservation| &reservation.path == path)
+            {
+                state.foreground = None;
+            }
+            if state.foreground_target.as_ref() == Some(path) {
+                state.foreground_target = None;
+            }
+            if state
+                .inflight
+                .as_ref()
+                .is_some_and(|inflight| &inflight.job.path == path)
+                && let Some(inflight) = state.inflight.as_mut()
+            {
+                inflight.job.cancel.store(true, Ordering::Relaxed);
+                inflight.job.forgotten = true;
+            }
+        }
+        // Invalidates every decode that passed its cancel check before now.
+        state.epoch = state.epoch.wrapping_add(1);
+        let forgotten = |remembered: &RememberedEntry| {
+            remembered
+                .media
+                .upgrade()
+                .is_some_and(|media| paths.contains(&media.source))
+        };
+        state.displayed_identities.retain(|entry| !forgotten(entry));
+        if state.trusted.as_ref().is_some_and(forgotten) {
+            state.trusted = None;
+        }
+        if state.previous.as_ref().is_some_and(forgotten) {
+            state.previous = None;
+        }
+        drop(state);
+        self.inner.shared.notify();
+    }
+
     /// Non-consuming cache/current/reservation lookup for the thumbnail worker.
     ///
     /// Background use only. Returns a borrowed `Arc` without promoting,
@@ -662,7 +715,10 @@ impl Prefetcher {
         cancel: &AtomicBool,
     ) -> Result<Arc<LoadedMedia>, String> {
         let identity = source_identity(path);
-        let purpose = lock(&self.inner.shared.state).purpose;
+        let (purpose, epoch) = {
+            let state = lock(&self.inner.shared.state);
+            (state.purpose, state.epoch)
+        };
         if cancel.load(Ordering::Relaxed) {
             return Err(format!("{}: cancelled", path.display()));
         }
@@ -681,9 +737,9 @@ impl Prefetcher {
         if cancel.load(Ordering::Relaxed) || self.inner.shared.shutdown.load(Ordering::Relaxed) {
             return Err(format!("{}: cancelled", path.display()));
         }
-        if state.purpose != purpose {
+        if state.purpose != purpose || state.epoch != epoch {
             return Err(format!(
-                "{}: cancelled: decode policy changed",
+                "{}: cancelled: invalidated during decode",
                 path.display()
             ));
         }
@@ -737,12 +793,18 @@ impl Prefetcher {
             else {
                 return JoinOutcome::NotInflight;
             };
+            if inflight.job.forgotten {
+                detach(&mut state, id, true);
+                shared.notify();
+                return JoinOutcome::NotInflight;
+            };
             if let Some(result) = &inflight.done {
                 if inflight.job.purpose != state.purpose {
                     detach(&mut state, id, true);
                     shared.notify();
                     return JoinOutcome::NotInflight;
                 }
+                let epoch = state.epoch;
                 let result = result.clone();
                 detach(&mut state, id, true);
                 shared.notify();
@@ -758,8 +820,8 @@ impl Prefetcher {
                         }
                         let mut state = lock(&shared.state);
                         // The hook and freshness check ran unlocked; the policy
-                        // may have changed while they did.
-                        if state.purpose != entry.purpose {
+                        // or a forget may have invalidated this result since.
+                        if state.purpose != entry.purpose || state.epoch != epoch {
                             return JoinOutcome::NotInflight;
                         }
                         if cancel.load(Ordering::Relaxed) || shared.shutdown.load(Ordering::Relaxed)
@@ -888,6 +950,7 @@ fn run(shared: Arc<Shared>) {
                 path: path.clone(),
                 purpose: demand.purpose,
                 cancel: Arc::clone(&cancel),
+                forgotten: false,
             },
             waiters: 0,
             promoted: false,
@@ -976,6 +1039,11 @@ fn finish(shared: &Shared, id: u64, path: SourceRef, result: Result<DecodedEntry
     };
     if inflight.job.id != id {
         state.inflight = Some(inflight);
+        return;
+    }
+    if inflight.job.forgotten {
+        // Its pixels predate a forget/overwrite; waiters retry without it.
+        shared.notify();
         return;
     }
     if shared.shutdown.load(Ordering::Relaxed) {
@@ -1497,6 +1565,135 @@ mod tests {
             Arc::strong_count(&state.cache[&source].decoded.media),
             owners
         );
+        drop(state);
+        prefetch.shutdown();
+    }
+
+    #[test]
+    fn forget_paths_drops_cached_pixels_bytes_and_dimension_hints() {
+        let dir = TempDir::new();
+        let first = dir.file("keep.png");
+        let forgotten = dir.file("forget.png");
+        let prefetch = with_fake(settings(0, 1, 8), fixed(8, 4, 1));
+        let source = SourceRef::file(&forgotten);
+        prefetch.update_context(vec![first.clone(), forgotten.clone()], Some(first), None);
+        prefetch.set_allowed(true);
+        wait_until(|| prefetch.cached_dimensions(&source).is_some());
+        prefetch.set_allowed(false);
+        let bytes = prefetch.stats().bytes;
+        assert!(bytes > 0);
+        prefetch.forget_paths(std::slice::from_ref(&source));
+        assert_eq!(prefetch.cached_dimensions(&source), None);
+        assert_eq!(prefetch.stats().entries, 0);
+        assert_eq!(prefetch.stats().bytes, 0);
+        prefetch.shutdown();
+    }
+
+    #[test]
+    fn forgotten_inflight_results_are_never_published() {
+        let dir = TempDir::new();
+        let path = dir.file("page.png");
+        fs::write(&path, b"x").unwrap();
+        let source = SourceRef::file(&path);
+        let identity = source_identity(&source).unwrap();
+        let prefetch = with_fake(settings(0, 0, 0), fixed(4, 4, 1));
+        let entry = || DecodedEntry {
+            media: Arc::new(media(&path, 4, 4, 1)),
+            identity: identity.clone(),
+            purpose: DecodePurpose::Animated,
+        };
+
+        for (id, promoted, waiters) in [(7, true, 0), (8, false, 1)] {
+            {
+                let mut state = lock(&prefetch.inner.shared.state);
+                state.inflight = Some(Inflight {
+                    job: Job {
+                        id,
+                        epoch: state.epoch,
+                        path: source.clone(),
+                        purpose: DecodePurpose::Animated,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        forgotten: false,
+                    },
+                    waiters,
+                    promoted,
+                    done: None,
+                });
+                state.foreground_target = Some(source.clone());
+            }
+            prefetch.forget_paths(std::slice::from_ref(&source));
+            finish(&prefetch.inner.shared, id, source.clone(), Ok(entry()));
+            let state = lock(&prefetch.inner.shared.state);
+            assert!(state.inflight.is_none(), "finish must drop a forgotten job");
+            assert!(state.foreground.is_none());
+            assert!(!state.cache.contains_key(&source));
+        }
+        prefetch.shutdown();
+    }
+
+    #[test]
+    fn forgetting_during_delivery_rejects_a_joined_result() {
+        let dir = TempDir::new();
+        let path = dir.file("page.png");
+        fs::write(&path, b"x").unwrap();
+        let source = SourceRef::file(&path);
+        let identity = source_identity(&source).unwrap();
+        let prefetch = with_fake(settings(0, 0, 0), fixed(3, 3, 1));
+        {
+            let mut state = lock(&prefetch.inner.shared.state);
+            state.inflight = Some(Inflight {
+                job: Job {
+                    id: 11,
+                    epoch: state.epoch,
+                    path: source.clone(),
+                    purpose: DecodePurpose::Animated,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    forgotten: false,
+                },
+                waiters: 0,
+                promoted: false,
+                done: Some(Ok(DecodedEntry {
+                    media: Arc::new(media(&path, 8, 4, 1)),
+                    identity,
+                    purpose: DecodePurpose::Animated,
+                })),
+            });
+        }
+        let hook_prefetch = prefetch.clone();
+        let hook_source = source.clone();
+        prefetch.set_handoff_hook(move || {
+            hook_prefetch.forget_paths(std::slice::from_ref(&hook_source));
+        });
+        let cancel = AtomicBool::new(false);
+        let delivered = prefetch.load_source(&source, &cancel).unwrap();
+        assert_eq!(
+            delivered.frames[0].pixels.dimensions(),
+            (3, 3),
+            "the forgotten 8x4 result must not be delivered"
+        );
+        let state = lock(&prefetch.inner.shared.state);
+        assert!(state.cache.is_empty());
+        drop(state);
+        prefetch.shutdown();
+    }
+
+    #[test]
+    fn forgetting_during_a_fresh_decode_rejects_the_result() {
+        let dir = TempDir::new();
+        let path = dir.file("page.png");
+        fs::write(&path, b"x").unwrap();
+        let source = SourceRef::file(&path);
+        let prefetch = with_fake(settings(0, 0, 0), fixed(3, 3, 1));
+        let hook_prefetch = prefetch.clone();
+        let hook_source = source.clone();
+        prefetch.set_handoff_hook(move || {
+            hook_prefetch.forget_paths(std::slice::from_ref(&hook_source));
+        });
+        let cancel = AtomicBool::new(false);
+        let error = prefetch.load_source(&source, &cancel).unwrap_err();
+        assert!(error.contains("invalidated"), "{error}");
+        let state = lock(&prefetch.inner.shared.state);
+        assert!(state.cache.is_empty());
         drop(state);
         prefetch.shutdown();
     }
@@ -2461,6 +2658,7 @@ mod tests {
                     path: SourceRef::file(&b),
                     purpose: DecodePurpose::Animated,
                     cancel: Arc::new(AtomicBool::new(false)),
+                    forgotten: false,
                 },
                 waiters: 1,
                 promoted: false,

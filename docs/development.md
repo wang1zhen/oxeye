@@ -19,7 +19,7 @@ pinned by `Cargo.lock`; no vendored sources are required.
 | `sys-locale` | `0.3.2` | One-time OS locale lookup |
 | `serde`, `serde_json` | `1.0.229`, `1.0.154` | Settings persistence |
 | `dirs` | `5.0.1` | User config directory |
-| `tempfile` | `3.27.0` | Same-directory atomic settings save |
+| `tempfile` | `3.27.0` | Same-directory atomic settings and image saves |
 
 The package declares `rust-version = "1.95"`. Release packaging builds with Rust
 1.95.0, exercising compilation; local checks and the full test suite use Rust
@@ -31,6 +31,10 @@ The package declares `rust-version = "1.95"`. Release packaging builds with Rust
   navigation-queue orchestration, candidate/gesture handling.
 - `model.rs` — bounded image reads, static decode, GIF preflight/composition,
   EXIF orientation, format detection, source limits.
+- `edit.rs` — framework-free edit session: base/preview, bounded op stack,
+  crop/rotate/flip pixels, aspect fitting, memory-budget validation.
+- `export.rs` — framework-free writable-format detection, PNG/JPEG/WebP/BMP
+  encoding, atomic overwrite, permission inheritance.
 - `source.rs` — virtual `SourceRef` files/archive entries, ZIP/RAR/7z catalogs,
   archive fingerprints, and bounded entry reads.
 - `progress.rs` — `progress.json` v1 resume store and per-page layout overrides.
@@ -91,9 +95,19 @@ bindings.
   gap, capped at 256 MiB; if the composite exceeds the cap it falls back to the
   selected page with a localized notice.
 - `1`/`9` fit, `0` actual size, `+`/`-` zoom, `Ctrl`/`Cmd`+`R`/`L` rotate,
-  `F11` or `Alt`+`Enter` fullscreen, and drag or `Alt`+drag pans.
-- `Escape` closes Settings first, then cancels queued navigation, then leaves
-  fullscreen. It never quits the app.
+  `F11` or `Alt`+`Enter` fullscreen, and drag or `Alt`+drag pans. While editing,
+  `R`/`L` rotate the image itself (an edit op), not the display.
+- `C` enters editing and starts crop mode; in edit mode it starts crop again
+  without creating a new session. `Enter` applies the crop, `Esc` cancels it.
+- `X`/`Y` flip horizontally/vertically; `Ctrl`/`Cmd`+`Z` undoes the last edit.
+  `Ctrl`/`Cmd`+`S` opens the overwrite confirmation; `Ctrl`/`Cmd`+`Shift`+`S`
+  opens Save As. Enter never confirms the overwrite dialog; only the button does.
+- `Escape` closes Settings first, then cancels a crop selection, then leaves the
+  edit session (discarding unsaved edits), then cancels queued navigation, then
+  leaves fullscreen. It never quits the app.
+- During an edit session, navigation, preview-strip clicks, Book `M`, wide `W`,
+  playback `P`, and drag-and-drop opening are ignored. Zoom/pan, `Ctrl`/`Cmd`+`C`
+  (copies the committed preview), fullscreen, and closing remain available.
 
 ## Archive sources
 
@@ -172,6 +186,54 @@ separate single-file component.
 - The group reports per-page frames, the earliest next deadline, whether any
   page is playing, and whether every animated page has finished. `P` controls
   the group in Book mode and the single animation in Single mode.
+
+## Editing and export
+
+- Editing is a temporary session over one static frame. The current display
+  rotation is baked into the session base once on entry (`0/90/180/270` quarter
+  turns), and `rotation` is zeroed so crop math always works in displayed
+  orientation. Exiting restores the original media, tiled frame, and full
+  rotation; the baked base is never treated as the on-disk original.
+- The session keeps `base`, a bounded operation stack (16 ops), and a
+  materialized `preview`. `apply` materializes the new op; `undo` pops and
+  replays the prefix from `base`. Memory uses N = one full RGBA buffer: `apply`
+  holds `base` + old preview + output (3N); `undo` holds base + replay input +
+  output (3N), or 4N if an external holder keeps the old preview. These are
+  session buffers, not a process RSS cap.
+- Previews are wrapped as a single-frame `LoadedMedia` and committed through the
+  existing `prepare_frame` → candidate → `commit_candidate` pipeline, so
+  textures, dimensions, fit/pan, fullscreen, and normal viewing paths behave like
+  ordinary images. Preview commits use `loaded=false`: they do not record
+  reading progress or page dimensions.
+- Overwrite/Save As use the pure `export.rs` API. The writable whitelist is
+  PNG/JPEG/WebP/BMP; GIF/TIFF/ICO are rejected for editing instead of silently
+  flattening. Archive members can be edited but only saved as a copy, never
+  written back into the archive. Overwrite is same-directory temp file +
+  `sync_all` + inherited permissions + atomic persist; cancel or failure leaves
+  the original bytes unchanged.
+- `Ctrl`/`Cmd`+`S` always opens a confirmation (full path, format, EXIF/ICC and
+  animation loss). Enter never confirms; the pressed-Enter events are stripped
+  before the modal's buttons are built. JPEG quality is adjustable (40–100,
+  default 90). WebP is lossless-only and warned as potentially larger.
+- Saving runs on one worker thread and is polled by the UI; a second save is
+  refused while one is running. Closing the window is deferred while an image
+  save runs and is re-requested only after a successful result. Save As onto the
+  frozen source path is routed through the overwrite transaction; an unknown
+  extension is an error.
+- After a successful overwrite the disk is the only truth:
+  `Prefetcher::forget_paths` drops cached pixels/dimensions (and marks in-flight
+  decodes forgotten/epoch-invalid), the saved page index is removed from
+  `page_dimensions`, thumbnail generation advances and caches clear, then the
+  file is re-decoded and reloaded at turns=0. Applying the pre-edit rotation here
+  would rotate the already-saved pixels a second time.
+- Book restore after editing uses the existing `load` path; a Book spread is
+  rebuilt as a whole at turns=0, so only the edited page is guaranteed to carry
+  the intended orientation. A layout-correction reload carries the turns of the
+  just-prepared frame; ordinary navigation still loads at 0.
+- Known limits: the atomic write does not fsync the parent directory; macOS
+  NFC/NFD normalization is outside path identity checks; large-image tile
+  switching and undo replay can stall; native visual/interactive acceptance of
+  the editing overlay, toolbar, and dialogs is still unverified.
 
 ## Prefetch
 
@@ -255,17 +317,21 @@ separate single-file component.
 
 ## Verification
 
-Final v0.2.0 status (2026-11-18, Linux/Rust 1.99):
+Final v0.3.0 status (2026-11-18, Linux/Rust 1.99):
 
 - `cargo fmt --all -- --check`: pass.
-- `cargo check --locked --all-targets`: pass.
-- `cargo test --locked --all-targets`: **293 pass, 2 ignored**.
-- `cargo clippy --locked --all-targets -- -D warnings`: pass.
-- CI for commit `c5a4d99` passed on Linux, macOS, and Windows.
-- Release dry-run workflow 44252633961 and tag workflow 44254035119 succeeded;
-  the published release is
-  <https://github.com/wang1zhen/oxeye/releases/tag/v0.2.0>.
-- Native archive/wide-page visual and interactive acceptance remains unverified.
+- `CARGO_BUILD_JOBS=2 cargo check --locked --all-targets`: pass.
+- `CARGO_BUILD_JOBS=2 cargo test --locked --all-targets`: **366 pass, 2 ignored**.
+- `CARGO_BUILD_JOBS=2 cargo clippy --locked --all-targets -- -D warnings`: pass.
+- `CARGO_BUILD_JOBS=2 cargo build --locked --release`: pass (1m 40s).
+- `cargo metadata --no-deps --format-version 1 --locked`: pass (Cargo.lock at 0.3.0).
+- `bash -n packaging/linux/package.sh`, `bash -n packaging/macos/package.sh`,
+  `plistlib` parse of `packaging/macos/Info.plist` (both version keys `0.3.0`),
+  and `python3` XML parse of `packaging/windows/main.wxs`: pass.
+- v0.3.0 CI, dry-run, and tag workflows have **not** been run. CI for the
+  previous v0.2.0 commit `c5a4d99` passed on Linux, macOS, and Windows.
+- Native visual/interactive acceptance of the editing toolbar, crop overlay,
+  save confirmation, and Save As dialog remains unverified.
 
 Full acceptance commands:
 
@@ -274,6 +340,9 @@ cargo fmt --all -- --check
 CARGO_BUILD_JOBS=2 cargo check --locked --all-targets
 CARGO_BUILD_JOBS=2 cargo test --locked --all-targets
 CARGO_BUILD_JOBS=2 cargo clippy --locked --all-targets -- -D warnings
+cargo metadata --no-deps --format-version 1 --locked
+bash -n packaging/linux/package.sh
+python3 -c "import xml.dom.minidom as m; m.parse('packaging/windows/main.wxs')"
 CARGO_BUILD_JOBS=2 cargo build --locked --release
 ```
 
@@ -292,9 +361,9 @@ finite+infinite and infinite+infinite spreads whose page regions changed,
 English/Simplified Chinese/Japanese and Automatic-Japanese screenshots, CJK
 glyphs, and visible/hidden preview strips. Settings-modal and input-driven
 behavior remain unit/source evidence only because no safe targeted Wayland input
-was available. Archive and wide-page native visual acceptance for v0.2.0 is not
-recorded here. No images were copied or uploaded, and test windows were closed
-afterwards.
+was available. Archive and wide-page native visual acceptance for v0.3.0 is not
+recorded here, and the new editing UI has only unit/state-machine evidence. No
+images were copied or uploaded, and test windows were closed afterwards.
 
 ## Platform prerequisites
 
@@ -305,7 +374,7 @@ afterwards.
 - macOS: Xcode command line tools with Apple's deprecated OpenGL. The Metal
   toolchain is not used.
 
-## Packaging v0.2.0
+## Packaging v0.3.0
 
 Release builds use Rust **1.95.0** with `--locked`; install that toolchain before
 running a packaging script. Run each script on its native OS from a checkout
@@ -326,16 +395,16 @@ authoring. Keep the checked-in MSI UpgradeCode unchanged between releases.
 
 Outputs in `dist/`:
 
-- `oxeye-0.2.0-windows-x86_64.msi` — per-machine Program Files install, Start
+- `oxeye-0.3.0-windows-x86_64.msi` — per-machine Program Files install, Start
   Menu shortcut, MIT license UI, and separate single-file third-party notices
   component. Static CRT build; dumpbin checks for VC++ runtime imports.
-- `oxeye-0.2.0-macos-universal.dmg` — `Oxeye.app` plus `/Applications` link,
+- `oxeye-0.3.0-macos-universal.dmg` — `Oxeye.app` plus `/Applications` link,
   macOS 11.0 minimum, ad-hoc signed; `Resources/` contains `LICENSE` and
   `THIRD_PARTY_NOTICES.md`; **no Developer ID signing or notarization**.
-- `oxeye-0.2.0-linux-amd64.deb` — binary, desktop entry, icons, copyright,
+- `oxeye-0.3.0-linux-amd64.deb` — binary, desktop entry, icons, copyright,
   `/usr/share/doc/oxeye/THIRD_PARTY_NOTICES.md`, and explicit
   GL/EGL/X11/Wayland/fontconfig/D-Bus/Zenity/portal dependencies.
-- `oxeye-0.2.0-linux-x86_64.AppImage` — thin AppDir with LICENSE and third-party
+- `oxeye-0.3.0-linux-x86_64.AppImage` — thin AppDir with LICENSE and third-party
   notices under `usr/share/doc/oxeye`; preserves the caller's working directory
   for relative image paths. Needs host graphics and portal libraries; does not
   bundle graphics drivers or promise arbitrary-distro compatibility.
@@ -348,26 +417,20 @@ are registered.
 
 ### Installer verification and release flow
 
-v0.2.0 packaging definitions include `THIRD_PARTY_NOTICES.md` in the deb and
+v0.3.0 packaging definitions include `THIRD_PARTY_NOTICES.md` in the deb and
 AppImage docs, the DMG's `Resources`, and the MSI as a separate single-file
 component. This avoids a multi-file auto-GUID component.
 
-Local v0.2.0 checks passed: `bash -n` on both shell scripts,
-`desktop-file-validate packaging/linux/oxeye.desktop`, Python YAML/XML parsing
-and `plistlib` validation, and `cargo metadata --no-deps --format-version 1 --locked`.
-The v0.2.0 packaging dry-run (workflow 44252633961) and tag workflow
-(44254035119) succeeded. `SHA256SUMS` verified all four assets:
-
-- `oxeye-0.2.0-linux-amd64.deb` — **5,339,784 B**
-- `oxeye-0.2.0-linux-x86_64.AppImage` — **8,194,552 B**
-- `oxeye-0.2.0-macos-universal.dmg` — **10,799,039 B**
-- `oxeye-0.2.0-windows-x86_64.msi` — **4,464,640 B**
-
-The v0.2.0 release is published at
-<https://github.com/wang1zhen/oxeye/releases/tag/v0.2.0>. Interactive installer
-UI, real macOS Intel hardware, Gatekeeper/SmartScreen approval, and actual
-GPU/hardware behavior remain unverified; Windows is unsigned and macOS is
-ad-hoc signed.
+Local v0.3.0 checks passed: `bash -n packaging/linux/package.sh`, Python XML
+parsing of `packaging/windows/main.wxs`, and
+`cargo metadata --no-deps --format-version 1 --locked`. The v0.3.0 packaging
+dry-run and tag workflow have **not** been run yet, so no 0.3.0 installer sizes,
+hashes, or release assets exist; previous release evidence stays in
+[CHANGELOG.md](../CHANGELOG.md) and [roadmap.md](roadmap.md). Interactive
+installer UI, real macOS Intel hardware, Gatekeeper/SmartScreen approval, and
+actual GPU/hardware behavior remain unverified; Windows is unsigned and macOS is
+ad-hoc signed. Native visual and interactive acceptance of the editing UI is
+also unverified.
 
 `.github/workflows/release.yml` builds on Ubuntu 22.04, macOS, and Windows with
 pinned Rust/tools/Actions. It checks deb metadata/install/remove and bundled
@@ -378,15 +441,15 @@ Installer execution does not replace interactive GUI or real-hardware checks; no
 macOS Intel hardware run, Gatekeeper/SmartScreen approval, or installer UI
 verification has been performed.
 
-Use `workflow_dispatch` for the v0.2.0 dry-run; it uploads Actions artifacts
+Use `workflow_dispatch` for the v0.3.0 dry-run; it uploads Actions artifacts
 **without creating a Release**. After successful smoke tests and independent
-review, push `v0.2.0` for the tag-only publish job. The tag must match
+review, push `v0.3.0` for the tag-only publish job. The tag must match
 Cargo.toml. The publish job requires exactly four installers, writes
 `SHA256SUMS`, and runs `gh release create --verify-tag --draft --generate-notes`;
 it never publishes automatically. Check downloads with
 `sha256sum --check SHA256SUMS` (Linux), `shasum -a 256` (macOS), or
 `Get-FileHash -Algorithm SHA256` (PowerShell). Only after user review should a
-maintainer run `gh release edit v0.2.0 --draft=false`.
+maintainer run `gh release edit v0.3.0 --draft=false`.
 
 ## CI
 
@@ -397,6 +460,15 @@ maintainer run `gh release edit v0.2.0 --draft=false`.
 
 ## Known limits
 
+- GIF, TIFF, ICO, and archive members cannot be edited; animated GIF editing is
+  not silently downgraded to a still frame.
+- Template collage is deferred. EXIF, ICC/XMP, and animation are not preserved.
+- JPEG overwrite is a lossy re-encode; WebP is lossless-only and may grow.
+- The atomic write does not fsync the parent directory, so a power loss right
+  after rename may not guarantee persistence.
+- macOS Unicode normalization (NFC/NFD) differences can defeat path identity
+  checks when the source disappeared during editing.
+- Large-image tile switching and undo replay can stall briefly.
 - No OS-level decode priority and no interruptible single static decode.
 - File identity is length + modification time; same-metadata replacements and
   metadata-identical symlink retargets can be missed.

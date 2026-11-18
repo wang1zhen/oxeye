@@ -2,6 +2,20 @@
 
 ## Released
 
+**v0.3.0** — 2026-11-18
+
+- Lightweight non-destructive editing for static PNG/JPEG/WebP/BMP: crop with
+  aspect presets, rotate, flip, undo, and live preview through the existing
+  tiled candidate pipeline.
+- Overwrite-first saving with an explicit confirmation (full path, format,
+  metadata loss), plus Save As. Writes use a same-directory temp file, `fsync`,
+  inherited permissions, and atomic persist; failure leaves the original intact.
+- Format whitelist for writing; GIF/TIFF/ICO and archive members stay read-only.
+- Overwrite cache invalidation chain (`Prefetcher::forget_paths` → page
+  dimensions → thumbnail generation → reload at turns=0).
+- Closing the window waits for a running image save; the edit session restores
+  the original frame and display rotation on exit.
+
 **v0.2.0** — 2026-11-18
 
 - Virtual archive reading for CBZ/ZIP, CBR/RAR, and CB7/7z without extracting to
@@ -28,15 +42,18 @@
 - Windows MSI, macOS universal DMG, Linux deb/AppImage.
 - Release: https://github.com/wang1zhen/oxeye/releases/tag/v0.1.0
 
-## Next: lightweight editing
+## Next: collage and animated GIF editing
 
 Planned, not implemented:
 
-- Non-destructive crop with common aspect ratios.
-- Save rotation/flip as a copy; optional overwrite with explicit confirmation.
-- Export PNG/JPEG/WebP with quality selection.
-- Multi-select from the preview strip and template-based collage (2/3/4/custom
-  columns), with fit/crop/gap/background and export.
+- Template-based collage: 2/3/4-cell and custom column layouts, gap and
+  background color, per-cell fit/crop/rotate, then export.
+- Animated GIF editing: an indexed-frame pipeline with quantization and frame
+  differencing. The intended reference flow is ImageMagick
+  `CoalesceImages` → `SetImageType(PaletteType)` → `OptimizeImageLayers`.
+  It is not in 0.3.0 because palette quality, output size, and implementation
+  complexity need a dedicated pass; shipping a poor re-encode would violate the
+  "no silent downgrade" rule.
 
 Keep the editor non-destructive by default: original files are not modified
 unless the user explicitly chooses overwrite, and writes are atomic.
@@ -51,6 +68,16 @@ unless the user explicitly chooses overwrite, and writes are atomic.
 
 ## Known limits
 
+- GIF, TIFF, ICO, and archive members cannot be edited; GIF animation editing is
+  not silently downgraded to a still frame.
+- Template collage is deferred.
+- Editing drops EXIF, ICC/XMP, and animation. JPEG overwrite is a lossy
+  re-encode; WebP is lossless-only and may grow.
+- The atomic write does not fsync the parent directory, so a power loss right
+  after rename may not guarantee persistence.
+- macOS Unicode normalization (NFC/NFD) differences can defeat path identity
+  checks when the source disappeared during editing.
+- Large-image tile switching and undo replay can stall briefly.
 - Archive reading is sequential; solid RAR/7z pages may require decoding
   predecessors. No arbitrary random access within a solid block.
 - Length+mtime archive fingerprints can miss same-metadata replacements.

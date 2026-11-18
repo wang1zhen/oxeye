@@ -84,6 +84,63 @@ pub struct Catalog {
     pub rotate_left: &'static str,
     pub rotate_left_tooltip: &'static str,
 
+    pub editing: &'static str,
+    pub editing_unsaved: &'static str,
+    pub edit_unsupported_format: &'static str,
+    pub edit_single_frame: &'static str,
+    pub edit_source_mismatch: &'static str,
+    pub edit_failed_prefix: &'static str,
+    pub edit_empty: &'static str,
+    pub edit_too_large: &'static str,
+    pub edit_too_many_ops: &'static str,
+    pub crop_empty: &'static str,
+    pub edit_discarded: &'static str,
+    pub crop: &'static str,
+    pub crop_tooltip: &'static str,
+    pub crop_hint: &'static str,
+    pub crop_zoom_hint: &'static str,
+    pub crop_aspect_tooltip: &'static str,
+    pub crop_apply: &'static str,
+    pub crop_apply_tooltip: &'static str,
+    pub crop_cancel: &'static str,
+    pub crop_cancel_tooltip: &'static str,
+    pub aspect_free: &'static str,
+    pub aspect_square: &'static str,
+    pub aspect_four_three: &'static str,
+    pub aspect_three_two: &'static str,
+    pub aspect_sixteen_nine: &'static str,
+    pub aspect_original: &'static str,
+    pub flip_h: &'static str,
+    pub flip_h_tooltip: &'static str,
+    pub flip_v: &'static str,
+    pub flip_v_tooltip: &'static str,
+    pub undo: &'static str,
+    pub undo_tooltip: &'static str,
+    pub save: &'static str,
+    pub save_tooltip: &'static str,
+    pub save_as: &'static str,
+    pub save_as_tooltip: &'static str,
+    pub edit_exit: &'static str,
+    pub edit_exit_tooltip: &'static str,
+    pub edit_rotate_tooltip: &'static str,
+    pub saving_image: &'static str,
+    pub save_blocked_closing: &'static str,
+    pub archive_cannot_overwrite: &'static str,
+    pub saved: &'static str,
+    pub saved_as_prefix: &'static str,
+    pub reopen_folder: &'static str,
+    pub export_failed_prefix: &'static str,
+    pub unknown_save_format_prefix: &'static str,
+    pub save_confirm_format_prefix: &'static str,
+    pub save_confirm_warning: &'static str,
+    pub save_confirm_irreversible: &'static str,
+    pub save_confirm_atomic: &'static str,
+    pub save_confirm_transparency: &'static str,
+    pub save_confirm_webp: &'static str,
+    pub save_confirm_quality: &'static str,
+    pub save_confirm_replace: &'static str,
+    pub save_confirm_replace_tooltip: &'static str,
+
     pub prefetch: &'static str,
     pub loading: &'static str,
     pub queued: &'static str,
@@ -199,6 +256,63 @@ pub static EN: Catalog = Catalog {
     rotate_left: "Rotate L",
     rotate_left_tooltip: "Rotate counterclockwise · Ctrl/Cmd+L",
 
+    editing: "Editing",
+    editing_unsaved: "Editing · unsaved",
+    edit_unsupported_format: "Editing supports only PNG, JPEG, WebP, and BMP. GIF, TIFF, ICO, and other archive members stay read-only.",
+    edit_single_frame: "Editing supports a single still image; animations stay read-only.",
+    edit_source_mismatch: "The selected file does not match the displayed image; reopen it before editing.",
+    edit_failed_prefix: "Could not edit: ",
+    edit_empty: "The image has no pixels to edit.",
+    edit_too_large: "Image too large to edit: ",
+    edit_too_many_ops: "Edit history is full (16 steps); save or undo before adding more.",
+    crop_empty: "The crop selection contains no pixels.",
+    edit_discarded: "Edits discarded; the file was not changed.",
+    crop: "Crop",
+    crop_tooltip: "Select a crop area · C",
+    crop_hint: "Drag to select · drag inside to move · double-click to reset · Enter applies · Esc cancels",
+    crop_zoom_hint: "Zoom in for pixel-accurate cropping.",
+    crop_aspect_tooltip: "Crop aspect ratio",
+    crop_apply: "Apply crop",
+    crop_apply_tooltip: "Apply the crop · Enter",
+    crop_cancel: "Cancel crop",
+    crop_cancel_tooltip: "Discard this crop selection · Esc",
+    aspect_free: "Free",
+    aspect_square: "1:1",
+    aspect_four_three: "4:3",
+    aspect_three_two: "3:2",
+    aspect_sixteen_nine: "16:9",
+    aspect_original: "Original",
+    flip_h: "Flip H",
+    flip_h_tooltip: "Mirror horizontally · X",
+    flip_v: "Flip V",
+    flip_v_tooltip: "Mirror vertically · Y",
+    undo: "Undo",
+    undo_tooltip: "Undo the last edit · Ctrl/Cmd+Z",
+    save: "Save",
+    save_tooltip: "Overwrite the original after confirmation · Ctrl/Cmd+S",
+    save_as: "Save As…",
+    save_as_tooltip: "Write a copy · Ctrl/Cmd+Shift+S",
+    edit_exit: "Exit",
+    edit_exit_tooltip: "Leave editing; edits are discarded",
+    edit_rotate_tooltip: "Rotate the image · Ctrl/Cmd+R / L",
+    saving_image: "Saving image…",
+    save_blocked_closing: "The window is closing; the image was not saved.",
+    archive_cannot_overwrite: "Files inside archives cannot be overwritten. Use Save As.",
+    saved: "Saved.",
+    saved_as_prefix: "Saved as ",
+    reopen_folder: " · reopen the folder to see the new file.",
+    export_failed_prefix: "Save failed: ",
+    unknown_save_format_prefix: "Unknown save format for ",
+    save_confirm_format_prefix: "Format: ",
+    save_confirm_warning: "EXIF, ICC profiles, and animation are not kept.",
+    save_confirm_irreversible: "Once saved, an overwrite cannot be undone in Oxeye.",
+    save_confirm_atomic: "Writes a temporary file, then swaps it in for the target.",
+    save_confirm_transparency: "This JPEG has transparency; alpha will be lost.",
+    save_confirm_webp: "WebP is written lossless; the file may get larger.",
+    save_confirm_quality: "JPEG quality",
+    save_confirm_replace: "Replace",
+    save_confirm_replace_tooltip: "Replace the file on disk",
+
     prefetch: "Prefetch",
     loading: "loading…",
     queued: "queued",
@@ -211,8 +325,8 @@ pub static EN: Catalog = Catalog {
     finished: "Finished",
     page: "page",
     pages: "pages",
-    pixel_read_only: "px · read-only",
-    idle_read_only: "Read-only · your files stay unchanged",
+    pixel_read_only: "px",
+    idle_read_only: "Files stay unchanged until you save.",
     name_separator: " + ",
 
     error_title: "Could not open this image or archive",
@@ -314,6 +428,63 @@ pub static ZH: Catalog = Catalog {
     rotate_left: "左转",
     rotate_left_tooltip: "逆时针旋转 · Ctrl/Cmd+L",
 
+    editing: "编辑中",
+    editing_unsaved: "编辑中 · 未保存",
+    edit_unsupported_format: "仅支持编辑 PNG、JPEG、WebP、BMP。GIF、TIFF、ICO 以及其他压缩包成员保持只读。",
+    edit_single_frame: "仅支持编辑单张静态图片；动画保持只读。",
+    edit_source_mismatch: "所选文件与当前显示的图片不一致，请重新打开后再编辑。",
+    edit_failed_prefix: "无法编辑：",
+    edit_empty: "这张图片没有可编辑的像素。",
+    edit_too_large: "图片过大，无法编辑：",
+    edit_too_many_ops: "编辑历史上限（16 步），请先保存或撤销。",
+    crop_empty: "裁剪区域不包含任何像素。",
+    edit_discarded: "已丢弃编辑，文件未被修改。",
+    crop: "裁剪",
+    crop_tooltip: "选择裁剪区域 · C",
+    crop_hint: "拖动选择 · 框内拖动移动 · 双击复位 · Enter 应用 · Esc 取消",
+    crop_zoom_hint: "放大后可精确到像素。",
+    crop_aspect_tooltip: "裁剪比例",
+    crop_apply: "应用裁剪",
+    crop_apply_tooltip: "应用裁剪 · Enter",
+    crop_cancel: "取消裁剪",
+    crop_cancel_tooltip: "放弃本次裁剪 · Esc",
+    aspect_free: "自由",
+    aspect_square: "1:1",
+    aspect_four_three: "4:3",
+    aspect_three_two: "3:2",
+    aspect_sixteen_nine: "16:9",
+    aspect_original: "原图",
+    flip_h: "水平翻转",
+    flip_h_tooltip: "水平镜像 · X",
+    flip_v: "垂直翻转",
+    flip_v_tooltip: "垂直镜像 · Y",
+    undo: "撤销",
+    undo_tooltip: "撤销上一步编辑 · Ctrl/Cmd+Z",
+    save: "保存",
+    save_tooltip: "确认后覆盖原文件 · Ctrl/Cmd+S",
+    save_as: "另存为…",
+    save_as_tooltip: "写出副本 · Ctrl/Cmd+Shift+S",
+    edit_exit: "退出",
+    edit_exit_tooltip: "退出编辑；未保存的修改会被丢弃",
+    edit_rotate_tooltip: "旋转图片 · Ctrl/Cmd+R / L",
+    saving_image: "正在保存图片…",
+    save_blocked_closing: "窗口正在关闭，图片未保存。",
+    archive_cannot_overwrite: "压缩包内文件不能覆盖，请使用另存为。",
+    saved: "已保存。",
+    saved_as_prefix: "已另存为 ",
+    reopen_folder: " · 重新打开文件夹可见新文件。",
+    export_failed_prefix: "保存失败：",
+    unknown_save_format_prefix: "无法识别的保存格式：",
+    save_confirm_format_prefix: "格式：",
+    save_confirm_warning: "EXIF、ICC 与动画不会保留。",
+    save_confirm_irreversible: "覆盖保存后无法在 Oxeye 中撤销。",
+    save_confirm_atomic: "先写入临时文件，再原子替换目标。",
+    save_confirm_transparency: "该 JPEG 含透明通道，保存后透明信息会丢失。",
+    save_confirm_webp: "WebP 使用无损编码，文件可能变大。",
+    save_confirm_quality: "JPEG 质量",
+    save_confirm_replace: "替换",
+    save_confirm_replace_tooltip: "替换磁盘上的文件",
+
     prefetch: "预取",
     loading: "正在加载…",
     queued: "排队",
@@ -326,8 +497,8 @@ pub static ZH: Catalog = Catalog {
     finished: "已结束",
     page: "页",
     pages: "页",
-    pixel_read_only: "像素 · 只读",
-    idle_read_only: "只读 · 文件不会被更改",
+    pixel_read_only: "像素",
+    idle_read_only: "在你保存之前，文件不会被修改。",
     name_separator: " + ",
 
     error_title: "无法打开此图片或压缩包",
@@ -429,6 +600,63 @@ pub static JA: Catalog = Catalog {
     rotate_left: "左回転",
     rotate_left_tooltip: "反時計回りに回転・Ctrl/Cmd+L",
 
+    editing: "編集中",
+    editing_unsaved: "編集中・未保存",
+    edit_unsupported_format: "編集できるのは PNG、JPEG、WebP、BMP のみです。GIF、TIFF、ICO、その他の書庫内ファイルは読み取り専用です。",
+    edit_single_frame: "編集できるのは静止画像 1 枚のみです。アニメーションは読み取り専用です。",
+    edit_source_mismatch: "選択中のファイルと表示中の画像が一致しません。開き直してから編集してください。",
+    edit_failed_prefix: "編集できません：",
+    edit_empty: "編集できるピクセルがありません。",
+    edit_too_large: "画像が大きすぎて編集できません：",
+    edit_too_many_ops: "編集履歴が上限（16 手）です。保存か取り消しをしてください。",
+    crop_empty: "切り抜き範囲にピクセルがありません。",
+    edit_discarded: "編集を破棄しました。ファイルは変更されていません。",
+    crop: "切り抜き",
+    crop_tooltip: "切り抜き範囲を選択・C",
+    crop_hint: "ドラッグで選択・内側をドラッグで移動・ダブルクリックで初期化・Enter で適用・Esc で取消",
+    crop_zoom_hint: "拡大するとピクセル単位で切り抜けます。",
+    crop_aspect_tooltip: "切り抜きの縦横比",
+    crop_apply: "切り抜きを適用",
+    crop_apply_tooltip: "切り抜きを適用・Enter",
+    crop_cancel: "切り抜きを取消",
+    crop_cancel_tooltip: "この切り抜きを破棄・Esc",
+    aspect_free: "自由",
+    aspect_square: "1:1",
+    aspect_four_three: "4:3",
+    aspect_three_two: "3:2",
+    aspect_sixteen_nine: "16:9",
+    aspect_original: "元画像",
+    flip_h: "左右反転",
+    flip_h_tooltip: "左右に鏡像・X",
+    flip_v: "上下反転",
+    flip_v_tooltip: "上下に鏡像・Y",
+    undo: "取り消す",
+    undo_tooltip: "直前の編集を取り消す・Ctrl/Cmd+Z",
+    save: "保存",
+    save_tooltip: "確認のうえ元ファイルを上書き・Ctrl/Cmd+S",
+    save_as: "名前を付けて保存…",
+    save_as_tooltip: "コピーを書き出す・Ctrl/Cmd+Shift+S",
+    edit_exit: "終了",
+    edit_exit_tooltip: "編集を終了し、変更を破棄",
+    edit_rotate_tooltip: "画像を回転・Ctrl/Cmd+R / L",
+    saving_image: "画像を保存中…",
+    save_blocked_closing: "ウィンドウを閉じているため、画像は保存されませんでした。",
+    archive_cannot_overwrite: "書庫内のファイルは上書きできません。名前を付けて保存してください。",
+    saved: "保存しました。",
+    saved_as_prefix: "別名で保存しました：",
+    reopen_folder: "・フォルダーを開き直すと新しいファイルが表示されます。",
+    export_failed_prefix: "保存に失敗しました：",
+    unknown_save_format_prefix: "保存形式を判別できません：",
+    save_confirm_format_prefix: "形式：",
+    save_confirm_warning: "EXIF、ICC プロファイル、アニメーションは保持されません。",
+    save_confirm_irreversible: "上書き保存は Oxeye 内では取り消せません。",
+    save_confirm_atomic: "一時ファイルに書き出してから、対象と置き換えます。",
+    save_confirm_transparency: "この JPEG には透明度があり、保存すると失われます。",
+    save_confirm_webp: "WebP は可逆圧縮で書き出すため、ファイルが大きくなる場合があります。",
+    save_confirm_quality: "JPEG 品質",
+    save_confirm_replace: "置き換える",
+    save_confirm_replace_tooltip: "ディスク上のファイルを置き換える",
+
     prefetch: "先読み",
     loading: "読み込み中…",
     queued: "待機",
@@ -441,8 +669,8 @@ pub static JA: Catalog = Catalog {
     finished: "終了",
     page: "ページ",
     pages: "ページ",
-    pixel_read_only: "px・読み取り専用",
-    idle_read_only: "読み取り専用・ファイルは変更されません",
+    pixel_read_only: "px",
+    idle_read_only: "保存するまでファイルは変更されません。",
     name_separator: " + ",
 
     error_title: "この画像またはアーカイブを開けませんでした",
@@ -487,6 +715,42 @@ impl Catalog {
 
     pub fn dimensions(&self, width: u32, height: u32) -> String {
         format!("{width} × {height} {}", self.pixel_read_only)
+    }
+
+    pub fn edit_oversize(&self, width: u32, height: u32) -> String {
+        format!("{}{width} × {height}", self.edit_too_large)
+    }
+
+    pub fn edit_failed(&self, error: &str) -> String {
+        format!("{}{error}", self.edit_failed_prefix)
+    }
+
+    pub fn save_confirm_format(&self, format: &str) -> String {
+        format!("{}{format}", self.save_confirm_format_prefix)
+    }
+
+    /// First line of the confirmation: the name that will be written or replaced.
+    pub fn save_confirm_heading(&self, name: &str, overwrite: bool) -> String {
+        match (self.ui_language, overwrite) {
+            (Language::SimplifiedChinese, true) => format!("将覆盖 {name}"),
+            (Language::SimplifiedChinese, false) => format!("另存为 {name}"),
+            (Language::Japanese, true) => format!("{name} を置き換えます"),
+            (Language::Japanese, false) => format!("{name} として保存します"),
+            (_, true) => format!("Replace {name}"),
+            (_, false) => format!("Save a copy as {name}"),
+        }
+    }
+
+    pub fn saved_as(&self, path: &str) -> String {
+        format!("{}{path}", self.saved_as_prefix)
+    }
+
+    pub fn export_failed(&self, error: &str) -> String {
+        format!("{}{error}", self.export_failed_prefix)
+    }
+
+    pub fn unknown_save_format(&self, name: &str) -> String {
+        format!("{}{name}", self.unknown_save_format_prefix)
     }
 
     pub fn book_pages(&self, pages: usize) -> String {
@@ -759,6 +1023,77 @@ mod tests {
             ("rotate_right_tooltip", catalog.rotate_right_tooltip),
             ("rotate_left", catalog.rotate_left),
             ("rotate_left_tooltip", catalog.rotate_left_tooltip),
+            ("editing", catalog.editing),
+            ("editing_unsaved", catalog.editing_unsaved),
+            ("edit_unsupported_format", catalog.edit_unsupported_format),
+            ("edit_single_frame", catalog.edit_single_frame),
+            ("edit_source_mismatch", catalog.edit_source_mismatch),
+            ("edit_failed_prefix", catalog.edit_failed_prefix),
+            ("edit_empty", catalog.edit_empty),
+            ("edit_too_large", catalog.edit_too_large),
+            ("edit_too_many_ops", catalog.edit_too_many_ops),
+            ("crop_empty", catalog.crop_empty),
+            ("edit_discarded", catalog.edit_discarded),
+            ("crop", catalog.crop),
+            ("crop_tooltip", catalog.crop_tooltip),
+            ("crop_hint", catalog.crop_hint),
+            ("crop_zoom_hint", catalog.crop_zoom_hint),
+            ("crop_aspect_tooltip", catalog.crop_aspect_tooltip),
+            ("crop_apply", catalog.crop_apply),
+            ("crop_apply_tooltip", catalog.crop_apply_tooltip),
+            ("crop_cancel", catalog.crop_cancel),
+            ("crop_cancel_tooltip", catalog.crop_cancel_tooltip),
+            ("aspect_free", catalog.aspect_free),
+            ("aspect_square", catalog.aspect_square),
+            ("aspect_four_three", catalog.aspect_four_three),
+            ("aspect_three_two", catalog.aspect_three_two),
+            ("aspect_sixteen_nine", catalog.aspect_sixteen_nine),
+            ("aspect_original", catalog.aspect_original),
+            ("flip_h", catalog.flip_h),
+            ("flip_h_tooltip", catalog.flip_h_tooltip),
+            ("flip_v", catalog.flip_v),
+            ("flip_v_tooltip", catalog.flip_v_tooltip),
+            ("undo", catalog.undo),
+            ("undo_tooltip", catalog.undo_tooltip),
+            ("save", catalog.save),
+            ("save_tooltip", catalog.save_tooltip),
+            ("save_as", catalog.save_as),
+            ("save_as_tooltip", catalog.save_as_tooltip),
+            ("edit_exit", catalog.edit_exit),
+            ("edit_exit_tooltip", catalog.edit_exit_tooltip),
+            ("edit_rotate_tooltip", catalog.edit_rotate_tooltip),
+            ("saving_image", catalog.saving_image),
+            ("save_blocked_closing", catalog.save_blocked_closing),
+            ("archive_cannot_overwrite", catalog.archive_cannot_overwrite),
+            ("saved", catalog.saved),
+            ("saved_as_prefix", catalog.saved_as_prefix),
+            ("reopen_folder", catalog.reopen_folder),
+            ("export_failed_prefix", catalog.export_failed_prefix),
+            (
+                "unknown_save_format_prefix",
+                catalog.unknown_save_format_prefix,
+            ),
+            (
+                "save_confirm_format_prefix",
+                catalog.save_confirm_format_prefix,
+            ),
+            ("save_confirm_warning", catalog.save_confirm_warning),
+            (
+                "save_confirm_irreversible",
+                catalog.save_confirm_irreversible,
+            ),
+            ("save_confirm_atomic", catalog.save_confirm_atomic),
+            (
+                "save_confirm_transparency",
+                catalog.save_confirm_transparency,
+            ),
+            ("save_confirm_webp", catalog.save_confirm_webp),
+            ("save_confirm_quality", catalog.save_confirm_quality),
+            ("save_confirm_replace", catalog.save_confirm_replace),
+            (
+                "save_confirm_replace_tooltip",
+                catalog.save_confirm_replace_tooltip,
+            ),
             ("prefetch", catalog.prefetch),
             ("loading", catalog.loading),
             ("queued", catalog.queued),
@@ -799,7 +1134,7 @@ mod tests {
     #[test]
     fn every_catalog_field_is_non_empty() {
         for catalog in [&EN, &ZH, &JA] {
-            assert_eq!(fields(catalog).len(), 105, "catalog field list is stale");
+            assert_eq!(fields(catalog).len(), 161, "catalog field list is stale");
             for (name, value) in fields(catalog) {
                 assert!(!value.trim().is_empty(), "{name} is empty");
             }
@@ -872,5 +1207,30 @@ mod tests {
         assert_eq!(EN.language_name(Language::SimplifiedChinese), "简体中文");
         assert_eq!(JA.language_name(Language::Japanese), "日本語");
         assert_eq!(ZH.language_name(Language::Automatic), ZH.automatic);
+    }
+
+    #[test]
+    fn save_confirm_heading_names_the_target_in_every_language() {
+        for catalog in [&EN, &ZH, &JA] {
+            let overwrite = catalog.save_confirm_heading("photo.jpg", true);
+            let copy = catalog.save_confirm_heading("photo.jpg", false);
+            assert!(overwrite.contains("photo.jpg"), "{overwrite}");
+            assert!(copy.contains("photo.jpg"), "{copy}");
+            assert_ne!(overwrite, copy);
+        }
+        // Chinese prefixes the verb, Japanese suffixes it.
+        assert!(ZH.save_confirm_heading("a.png", true).starts_with("将覆盖"));
+        assert!(
+            JA.save_confirm_heading("a.png", true)
+                .ends_with("置き換えます")
+        );
+        assert!(
+            EN.save_confirm_heading("a.png", true)
+                .starts_with("Replace")
+        );
+        assert_ne!(
+            EN.save_confirm_heading("a.png", true),
+            ZH.save_confirm_heading("a.png", true)
+        );
     }
 }

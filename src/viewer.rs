@@ -347,9 +347,139 @@ impl Playback {
     }
 }
 
+/// Image placement in UI points: the painted origin/scale, rounded to physical pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CanvasTransform {
+    pub origin: [f32; 2],
+    pub scale: f32,
+}
+
+impl CanvasTransform {
+    /// Maps image space to UI points for the crop overlay.
+    ///
+    /// `origin` uses the same f64 formula as `paint_tiles` (`main.rs:5226-5227`)
+    /// and the same physical-pixel snapping as `TileGeometry::project`, so the
+    /// image's top-left corner matches the painted tile (the test asserts
+    /// equality there). Non-zero coordinates can still differ from painted
+    /// edges by ≤1 physical pixel because of f32 evaluation order and per-tile
+    /// sample rounding. That continuous mapping is fine for crop lines; do not
+    /// require each crop edge to sit exactly on every tile's snapped edge.
+    /// `dpi` must be positive.
+    pub fn new(
+        viewport_center: [f32; 2],
+        dimensions: (u32, u32),
+        scale: f32,
+        pan: [f32; 2],
+        dpi: f32,
+    ) -> Self {
+        let dpi = f64::from(dpi);
+        let origin = [
+            f64::from(viewport_center[0]) - f64::from(dimensions.0) * f64::from(scale) / 2.
+                + f64::from(pan[0]),
+            f64::from(viewport_center[1]) - f64::from(dimensions.1) * f64::from(scale) / 2.
+                + f64::from(pan[1]),
+        ];
+        // `project` rounds the origin to physical pixels, then floors the
+        // sample start; floor of an integer is that integer.
+        let snap = |value: f64| ((value * dpi).round() / dpi) as f32;
+        Self {
+            origin: [snap(origin[0]), snap(origin[1])],
+            scale,
+        }
+    }
+}
+
+/// UI point to image pixel; `scale` is the same fit/zoom factor used for drawing.
+pub fn screen_to_image(transform: CanvasTransform, pos: [f32; 2]) -> [f32; 2] {
+    [
+        (pos[0] - transform.origin[0]) / transform.scale,
+        (pos[1] - transform.origin[1]) / transform.scale,
+    ]
+}
+
+/// Image rect `[x, y, w, h]` to a UI rect with the same layout.
+pub fn image_rect_to_screen(transform: CanvasTransform, rect: [f32; 4]) -> [f32; 4] {
+    [
+        transform.origin[0] + rect[0] * transform.scale,
+        transform.origin[1] + rect[1] * transform.scale,
+        rect[2] * transform.scale,
+        rect[3] * transform.scale,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canvas_transform_round_trips_points_with_pan_and_zoom() {
+        let transform = CanvasTransform::new([400., 300.], (800, 600), 0.5, [10., -20.], 1.);
+        assert_eq!(transform.origin, [210., 130.]);
+        assert_eq!(
+            image_rect_to_screen(transform, [0., 0., 1., 1.]),
+            [210., 130., 0.5, 0.5]
+        );
+        let screen = image_rect_to_screen(transform, [40., 20., 8., 6.]);
+        assert_eq!(screen, [230., 140., 4., 3.]);
+        assert_eq!(
+            screen_to_image(transform, [screen[0], screen[1]]),
+            [40., 20.]
+        );
+        assert_eq!(
+            screen_to_image(transform, [screen[0] + screen[2], screen[1] + screen[3]]),
+            [48., 26.]
+        );
+        // A centered, unscaled image maps screen center to image center.
+        let centered = CanvasTransform::new([400., 300.], (800, 600), 1., [0., 0.], 1.);
+        assert_eq!(screen_to_image(centered, [400., 300.]), [400., 300.]);
+        assert_eq!(screen_to_image(centered, [0., 0.]), [0., 0.]);
+    }
+
+    #[test]
+    fn canvas_transform_origin_matches_tile_projection_at_each_dpi() {
+        // (center, dimensions, scale, pan, dpi)
+        let cases = [
+            ([400., 300.], (3, 2), 1., [0.25, 0.25], 1.),
+            ([400., 300.], (800, 600), 0.25, [0.25, -7.], 1.),
+            ([400., 300.], (800, 600), 0.5, [10., -20.], 1.25),
+            ([640., 480.], (900, 700), 1.731, [-3., 7.], 1.5),
+            ([400., 300.], (800, 600), 1., [0., 0.], 2.),
+        ];
+        for (center, dimensions, scale, pan, dpi) in cases {
+            let transform = CanvasTransform::new(center, dimensions, scale, pan, dpi);
+            let origin = [
+                f64::from(center[0]) - f64::from(dimensions.0) * f64::from(scale) / 2.
+                    + f64::from(pan[0]),
+                f64::from(center[1]) - f64::from(dimensions.1) * f64::from(scale) / 2.
+                    + f64::from(pan[1]),
+            ];
+            let geometry = TileGeometry {
+                core: Rect {
+                    x: 0,
+                    y: 0,
+                    width: dimensions.0,
+                    height: dimensions.1,
+                },
+                sample: Rect {
+                    x: 0,
+                    y: 0,
+                    width: dimensions.0,
+                    height: dimensions.1,
+                },
+            };
+            let projected = geometry.project(origin, f64::from(scale), f64::from(dpi));
+            // Tolerance 0 covers only the origin: both sides compute the same
+            // f64 value and snap it to a physical pixel. Non-zero coordinates
+            // and per-tile sample edges may still differ by ≤1 physical pixel.
+            assert_eq!(transform.origin[0], projected.sample[0] as f32);
+            assert_eq!(transform.origin[1], projected.sample[1] as f32);
+            assert_eq!(transform.origin[0], projected.core[0] as f32);
+            assert_eq!(transform.origin[1], projected.core[1] as f32);
+        }
+        // Reproducer: a half-point offset snaps to 399, not 398.75.
+        let transform = CanvasTransform::new([400., 300.], (3, 2), 1., [0.25, 0.25], 1.);
+        assert_eq!(transform.origin, [399., 299.]);
+    }
 
     #[test]
     fn copy_single_keeps_full_resolution_and_rotated_rgba_pixels() {

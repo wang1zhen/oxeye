@@ -4,7 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 export RUSTUP_TOOLCHAIN=1.95.0
-version=0.2.0
+version=0.3.0
 tools="$root/.tools/appimage"
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT

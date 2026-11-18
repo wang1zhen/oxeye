@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
-  <Package Name="Oxeye" Manufacturer="wang1zhen" Version="0.2.0"
+  <Package Name="Oxeye" Manufacturer="wang1zhen" Version="0.3.0"
            Language="1033" Scope="perMachine"
            UpgradeCode="6A6A9FE8-D8E1-47B9-8375-66AFA4A9D444">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Oxeye is already installed." />

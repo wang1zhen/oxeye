@@ -1,9 +1,9 @@
 [package]
 name = "oxeye"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
-description = "A small read-only desktop image viewer built with egui"
+description = "A lightweight desktop image viewer and editor built with egui"
 license = "MIT"
 repository = "https://github.com/wang1zhen/oxeye"
 

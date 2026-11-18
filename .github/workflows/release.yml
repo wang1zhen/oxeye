@@ -34,7 +34,7 @@ jobs:
           from pathlib import Path
           manifest = Path("Cargo.toml").read_text().split("[dependencies]")[0]
           version = re.search(r'^version = "([^"]+)"$', manifest, re.M).group(1)
-          assert version == "0.2.0", "Update installer versions and artifact names for a new release"
+          assert version == "0.3.0", "Update installer versions and artifact names for a new release"
           if os.environ["REF_TYPE"] == "tag":
               assert os.environ["REF_NAME"] == f"v{version}", "Tag must match Cargo.toml"
           PY
@@ -62,9 +62,9 @@ jobs:
       - name: Inspect and install/uninstall deb
         run: |
           desktop-file-validate packaging/linux/oxeye.desktop
-          dpkg-deb --info dist/oxeye-0.2.0-linux-amd64.deb
-          dpkg-deb --contents dist/oxeye-0.2.0-linux-amd64.deb
-          sudo apt-get install -y ./dist/oxeye-0.2.0-linux-amd64.deb
+          dpkg-deb --info dist/oxeye-0.3.0-linux-amd64.deb
+          dpkg-deb --contents dist/oxeye-0.3.0-linux-amd64.deb
+          sudo apt-get install -y ./dist/oxeye-0.3.0-linux-amd64.deb
           test -x /usr/bin/oxeye
           test -f /usr/share/doc/oxeye/copyright
           test -f /usr/share/doc/oxeye/THIRD_PARTY_NOTICES.md
@@ -76,7 +76,7 @@ jobs:
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: |
-          image="$GITHUB_WORKSPACE/dist/oxeye-0.2.0-linux-x86_64.AppImage"
+          image="$GITHUB_WORKSPACE/dist/oxeye-0.3.0-linux-x86_64.AppImage"
           chmod +x "$image"
           mkdir -p "$RUNNER_TEMP/oxeye-extract"
           (cd "$RUNNER_TEMP/oxeye-extract" && "$image" --appimage-extract)
@@ -120,7 +120,7 @@ jobs:
         run: bash packaging/macos/package.sh
       - name: Verify and mount DMG
         run: |
-          image=dist/oxeye-0.2.0-macos-universal.dmg
+          image=dist/oxeye-0.3.0-macos-universal.dmg
           hdiutil verify "$image"
           mount="$RUNNER_TEMP/oxeye-mount"
           mkdir -p "$mount"
@@ -157,7 +157,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $msi = (Resolve-Path "dist/oxeye-0.2.0-windows-x86_64.msi").Path
+          $msi = (Resolve-Path "dist/oxeye-0.3.0-windows-x86_64.msi").Path
           $installLog = Join-Path $PWD "dist/msi-install.log"
           $uninstallLog = Join-Path $PWD "dist/msi-uninstall.log"
           $exe = Join-Path $env:ProgramFiles "Oxeye/oxeye.exe"
@@ -203,10 +203,10 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           expected = {
-              "oxeye-0.2.0-linux-amd64.deb",
-              "oxeye-0.2.0-linux-x86_64.AppImage",
-              "oxeye-0.2.0-macos-universal.dmg",
-              "oxeye-0.2.0-windows-x86_64.msi",
+              "oxeye-0.3.0-linux-amd64.deb",
+              "oxeye-0.3.0-linux-x86_64.AppImage",
+              "oxeye-0.3.0-macos-universal.dmg",
+              "oxeye-0.3.0-windows-x86_64.msi",
           }
           assert {p.name for p in Path(".").iterdir()} == expected, "Expected exactly four installers"
           PY

@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.3.0 — 2026-11-18
+
+- Lightweight, non-destructive editing for single static PNG/JPEG/WebP/BMP
+  images: crop with Free/1:1/4:3/3:2/16:9/Original presets, 90° rotate, flip,
+  and undo (up to 16 steps).
+- Entering editing bakes the current display rotation into the preview once;
+  exiting restores the original frame and direction. Previews reuse the normal
+  tiled candidate pipeline.
+- Save strategy: overwrite-first with an explicit confirmation naming the full
+  path and target format, plus Save As through the native file dialog. Ctrl/Cmd+S
+  overwrites; Ctrl/Cmd+Shift+S writes a copy.
+- Format whitelist for writing: PNG, JPEG, WebP, BMP. GIF, TIFF, ICO, and
+  archive members are read-only; editing is rejected instead of silently
+  flattening animation or multi-page files.
+- Atomic writes: same-directory temporary file, `sync_all`, inherited
+  permissions, then atomic persist. Cancel or failure leaves the original bytes
+  and permissions unchanged.
+- Successful overwrite invalidates caches and reloads at turns=0:
+  `Prefetcher::forget_paths`, page dimensions, thumbnails, then a fresh decode.
+  Closing the window waits for a running image save.
+- Settings schema remains v4 (editing state is transient).
+
+### Limits
+
+- GIF, TIFF, and ICO cannot be edited in this version. Animated GIF editing is
+  not silently downgraded to a still frame; it is not implemented yet.
+- Template-based collage is deferred.
+- EXIF, ICC/XMP metadata, and animation are not preserved.
+- WebP is written lossless only; photographic sources may become larger.
+- JPEG overwrite is a lossy re-encode (default quality 90).
+- The atomic write does not fsync the parent directory; a power loss immediately
+  after rename may not guarantee persistence.
+- macOS filesystem Unicode normalization (NFC/NFD) differences can make the same
+  path look different when the source was deleted during editing.
+- Reloading a large image tiles synchronously; undo replays from the base image,
+  so both may stall briefly on very large images.
+- Native visual and interactive acceptance of the editing UI remains unverified.
+
 ## 0.2.0 — 2026-11-18
 
 - Read CBZ/ZIP, CBR/RAR, and CB7/7z archives as virtual image folders without

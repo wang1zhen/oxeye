@@ -1,6 +1,8 @@
 //! Oxeye: a small read-only image viewer built on egui/eframe.
 
 mod comic;
+mod edit;
+mod export;
 mod model;
 mod navigation;
 mod preload;
@@ -13,11 +15,9 @@ mod ui_state;
 mod ui_text;
 mod viewer;
 
-#[cfg(test)]
-use std::path::Path;
 use std::{
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -80,6 +80,15 @@ enum Action {
     Settings,
     ToggleMode,
     WideToggle,
+    Edit,
+    UndoEdit,
+    FlipHorizontal,
+    FlipVertical,
+    SaveOverwrite,
+    SaveAs,
+    CropApply,
+    CropCancel,
+    EditExit,
 }
 
 /// Maps one key press to one viewer action. Keeping this pure makes key order
@@ -87,6 +96,9 @@ enum Action {
 fn key_action(key: Key, modifiers: Modifiers) -> Option<Action> {
     if modifiers.command && !modifiers.alt {
         return match key {
+            Key::S if modifiers.shift => Some(Action::SaveAs),
+            Key::S => Some(Action::SaveOverwrite),
+            Key::Z => Some(Action::UndoEdit),
             Key::O => Some(Action::Open),
             Key::C => Some(Action::Copy),
             Key::W => Some(Action::Close),
@@ -129,12 +141,29 @@ fn key_action(key: Key, modifiers: Modifiers) -> Option<Action> {
         Key::P => Some(Action::Playback),
         Key::M if !modifiers.shift => Some(Action::ToggleMode),
         Key::W if modifiers == Modifiers::NONE => Some(Action::WideToggle),
+        Key::C if modifiers == Modifiers::NONE => Some(Action::Edit),
+        Key::X if modifiers == Modifiers::NONE => Some(Action::FlipHorizontal),
+        Key::Y if modifiers == Modifiers::NONE => Some(Action::FlipVertical),
+        Key::Enter => Some(Action::CropApply),
         _ => None,
     }
 }
 
 fn action_allows_repeat(action: Action) -> bool {
-    !matches!(action, Action::ToggleMode | Action::WideToggle)
+    !matches!(
+        action,
+        Action::ToggleMode
+            | Action::WideToggle
+            | Action::Edit
+            | Action::UndoEdit
+            | Action::FlipHorizontal
+            | Action::FlipVertical
+            | Action::SaveOverwrite
+            | Action::SaveAs
+            | Action::CropApply
+            | Action::CropCancel
+            | Action::EditExit
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -439,6 +468,7 @@ enum Work {
         ReadingMode,
         Vec<usize>,
         Language,
+        u8,
     ),
     Spread {
         media: Vec<Arc<model::LoadedMedia>>,
@@ -489,7 +519,7 @@ struct SpreadPageUpdate {
     tiled: Arc<TiledFrame>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct Rotation {
     requested: u8,
     displayed: u8,
@@ -509,6 +539,415 @@ impl Rotation {
         self.displayed = turns;
         self.requested = turns;
     }
+}
+
+/// Confirmation before a destructive write; Enter never confirms, only the button does.
+struct SaveConfirm {
+    path: PathBuf,
+    format: export::ExportFormat,
+    /// True = replace the frozen edit source; false = Save As copy.
+    overwrite: bool,
+}
+
+/// One running `atomic_write`; the worker owns the pixels, not the UI.
+struct SaveJob {
+    receiver: Receiver<Result<(), String>>,
+    overwrite: bool,
+    path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CropAspect {
+    Free,
+    Square,
+    FourThree,
+    ThreeTwo,
+    SixteenNine,
+    Original,
+}
+
+impl CropAspect {
+    fn ratio(self, dimensions: (u32, u32)) -> Option<(u32, u32)> {
+        match self {
+            Self::Free => None,
+            Self::Square => Some((1, 1)),
+            Self::FourThree => Some((4, 3)),
+            Self::ThreeTwo => Some((3, 2)),
+            Self::SixteenNine => Some((16, 9)),
+            Self::Original => Some(dimensions),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CropHandle {
+    NorthWest,
+    North,
+    NorthEast,
+    East,
+    SouthEast,
+    South,
+    SouthWest,
+    West,
+}
+
+#[derive(Clone, Copy)]
+enum CropDrag {
+    New {
+        anchor: [f32; 2],
+    },
+    /// Origin rect + press point: every frame recomputes from the total delta,
+    /// so sub-pixel drags cannot round away.
+    Move {
+        origin: edit::PixelRect,
+        anchor: [f32; 2],
+    },
+    Resize {
+        handle: CropHandle,
+        /// Press-time rect: the outward-drawn handle never becomes a boundary.
+        origin: edit::PixelRect,
+        anchor: [f32; 2],
+    },
+}
+
+struct CropState {
+    rect: edit::PixelRect,
+    aspect: CropAspect,
+    drag: Option<CropDrag>,
+}
+
+/// Editing is a temporary mode; the on-disk frame stays in `original_media`.
+struct EditUi {
+    session: edit::EditSession,
+    /// Frozen at entry: never follow `selected`, which may point at a failed load.
+    source: SourceRef,
+    original_media: Arc<model::LoadedMedia>,
+    original_tiled: Option<Arc<TiledFrame>>,
+    original_rotation: Rotation,
+    restore_mode: Option<ReadingMode>,
+    crop: Option<CropState>,
+    confirm: Option<SaveConfirm>,
+    saving: Option<SaveJob>,
+    quality: u8,
+}
+
+/// Book -> Single transition waiting for its load to commit.
+struct PendingEdit {
+    source: SourceRef,
+    rotation: Rotation,
+    restore: ReadingMode,
+    selected: Option<SourceRef>,
+    displayed: Option<SourceRef>,
+    current_file: Option<SourceRef>,
+    crop: bool,
+}
+
+fn editable_format(source: &SourceRef) -> Option<export::ExportFormat> {
+    match source {
+        SourceRef::File(path) => export::format_for_path(path),
+        SourceRef::Archive { name, .. } => export::format_for_path(Path::new(name)),
+    }
+}
+
+fn format_label(format: export::ExportFormat) -> &'static str {
+    match format {
+        export::ExportFormat::Png => "PNG",
+        export::ExportFormat::Jpeg => "JPEG",
+        export::ExportFormat::Webp => "WebP",
+        export::ExportFormat::Bmp => "BMP",
+    }
+}
+
+fn edit_error_text(text: &ui_text::Catalog, error: edit::EditError) -> String {
+    match error {
+        edit::EditError::EmptyImage => text.edit_empty.to_owned(),
+        edit::EditError::ZeroArea => text.crop_empty.to_owned(),
+        edit::EditError::Oversize { width, height } => text.edit_oversize(width, height),
+        edit::EditError::TooManyOps => text.edit_too_many_ops.to_owned(),
+    }
+}
+
+/// Absolute identity for a path, resolving the deepest existing ancestor.
+///
+/// Nonexistent targets are compared by their future parent (symlinks resolved
+/// where they exist) plus the remaining components, normalized for `.`/`..`.
+fn identity_path(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut existing = absolute;
+    let mut remainder = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            break;
+        };
+        remainder.push(name.to_os_string());
+        match existing.parent() {
+            Some(parent) if parent != existing => existing = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    let mut resolved = existing.canonicalize().unwrap_or(existing);
+    for part in remainder.into_iter().rev() {
+        resolved.push(part);
+    }
+    let mut normalized = PathBuf::new();
+    for component in resolved.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Treats Save As onto the frozen source as the overwrite transaction.
+fn same_save_target(a: &Path, b: &Path) -> bool {
+    let a = identity_path(a);
+    let b = identity_path(b);
+    if a == b {
+        return true;
+    }
+    // Only the platform's default case-insensitive filesystems fold names;
+    // a false positive can only add one extra overwrite confirmation.
+    //
+    // Known limit: macOS can report the same file with different Unicode
+    // normalization (NFC vs NFD); that is outside this comparison.
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        return a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase();
+    }
+    false
+}
+
+/// Save As risks shown before the worker starts, so the user can still cancel.
+fn save_risk_reason(
+    text: &ui_text::Catalog,
+    format: export::ExportFormat,
+    transparent: bool,
+) -> Option<&'static str> {
+    match format {
+        export::ExportFormat::Webp => Some(text.save_confirm_webp),
+        export::ExportFormat::Jpeg if transparent => Some(text.save_confirm_transparency),
+        _ => None,
+    }
+}
+
+/// egui activates a focused button from an Enter key event regardless of
+/// modifiers; the save dialog strips every pressed Enter before rendering any
+/// button, while Space and assistive activation still work normally.
+fn save_confirm_strips_event(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key {
+            key: Key::Enter,
+            pressed: true,
+            ..
+        }
+    )
+}
+
+/// Handles are tested in screen points so they stay grabbable at any zoom. The
+/// hit box grows with the drawn handle and shares its centres, so what the user
+/// sees is what they grab. Overlapping hit boxes (a rect smaller than one handle)
+/// resolve to the nearest centre, never to the first one in the array.
+fn crop_handle_at(screen: [f32; 4], pos: Pos2, handle_size: f32) -> Option<CropHandle> {
+    let radius = handle_size * 0.8 + 2.;
+    crop_handle_points(screen, handle_size)
+        .into_iter()
+        .filter(|(_, center)| {
+            (pos.x - center.x).abs() <= radius && (pos.y - center.y).abs() <= radius
+        })
+        .min_by(|(_, a), (_, b)| a.distance_sq(pos).total_cmp(&b.distance_sq(pos)))
+        .map(|(handle, _)| handle)
+}
+
+/// Handles grow a little with the display scale: one point is a fraction of a
+/// millimetre on a 4K panel, so a fixed 7pt square becomes hard to grab.
+fn crop_handle_size(dpi: f32) -> f32 {
+    (8. + (dpi - 1.).max(0.) * 1.5).clamp(8., 12.)
+}
+
+/// Handle centres shared by drawing and hit-testing.
+///
+/// A rect too small for three handle widths (a 1×1 crop, or a tiny image at
+/// Fit) pushes its handles outward per axis, so the eight squares never pile up
+/// into one unclickable blob.
+fn crop_handle_points(screen: [f32; 4], size: f32) -> [(CropHandle, Pos2); 8] {
+    let [x, y, w, h] = screen;
+    let dx = if w < size * 3. { size } else { 0. };
+    let dy = if h < size * 3. { size } else { 0. };
+    let (right, bottom) = (x + w, y + h);
+    [
+        (CropHandle::NorthWest, Pos2::new(x - dx, y - dy)),
+        (CropHandle::North, Pos2::new(x + w / 2., y - dy)),
+        (CropHandle::NorthEast, Pos2::new(right + dx, y - dy)),
+        (CropHandle::East, Pos2::new(right + dx, y + h / 2.)),
+        (CropHandle::SouthEast, Pos2::new(right + dx, bottom + dy)),
+        (CropHandle::South, Pos2::new(x + w / 2., bottom + dy)),
+        (CropHandle::SouthWest, Pos2::new(x - dx, bottom + dy)),
+        (CropHandle::West, Pos2::new(x - dx, y + h / 2.)),
+    ]
+}
+
+fn crop_cursor(handle: CropHandle) -> CursorIcon {
+    match handle {
+        CropHandle::NorthWest | CropHandle::SouthEast => CursorIcon::ResizeNwSe,
+        CropHandle::NorthEast | CropHandle::SouthWest => CursorIcon::ResizeNeSw,
+        CropHandle::North | CropHandle::South => CursorIcon::ResizeVertical,
+        CropHandle::East | CropHandle::West => CursorIcon::ResizeHorizontal,
+    }
+}
+
+/// Ergonomics hint, not a hard limit: below half a point per image pixel a
+/// boundary is too coarse to place deliberately, so the toolbar suggests zooming.
+fn crop_needs_zoom(scale: f32) -> bool {
+    scale < 0.5
+}
+
+/// Moving window for the indeterminate progress bar, in points from the track's
+/// left edge. Never wider than the thumb and never outside the track.
+fn indeterminate_span(phase: f32, width: f32) -> (f32, f32) {
+    let thumb = (width * 0.3).min(120.);
+    let start = phase.clamp(0., 1.) * (width - thumb).max(0.);
+    (start, start + thumb)
+}
+
+/// Warning rows of the save confirmation: metadata loss and irreversibility for
+/// an overwrite, plus the format-specific risk. Order is stable for reading.
+fn save_warning_rows(
+    text: &ui_text::Catalog,
+    format: export::ExportFormat,
+    overwrite: bool,
+    transparent: bool,
+) -> Vec<&'static str> {
+    let mut rows = Vec::new();
+    if overwrite {
+        rows.push(text.save_confirm_warning);
+        rows.push(text.save_confirm_irreversible);
+    }
+    if let Some(reason) = save_risk_reason(text, format, transparent) {
+        rows.push(reason);
+    }
+    rows
+}
+
+/// A dragged rectangle always covers at least one pixel inside the image.
+fn crop_rect_from_points(a: [f32; 2], b: [f32; 2], dimensions: (u32, u32)) -> edit::PixelRect {
+    let max_x = dimensions.0.saturating_sub(1) as f32;
+    let max_y = dimensions.1.saturating_sub(1) as f32;
+    let x0 = a[0].min(b[0]).clamp(0., max_x);
+    let y0 = a[1].min(b[1]).clamp(0., max_y);
+    let x1 = a[0].max(b[0]).clamp(x0 + 1., dimensions.0 as f32);
+    let y1 = a[1].max(b[1]).clamp(y0 + 1., dimensions.1 as f32);
+    edit::PixelRect {
+        x: x0.round() as u32,
+        y: y0.round() as u32,
+        w: (x1 - x0).round().max(1.) as u32,
+        h: (y1 - y0).round().max(1.) as u32,
+    }
+}
+
+fn translate_crop(
+    rect: edit::PixelRect,
+    delta: [f32; 2],
+    dimensions: (u32, u32),
+) -> edit::PixelRect {
+    let x = (rect.x as f32 + delta[0])
+        .round()
+        .clamp(0., dimensions.0.saturating_sub(rect.w) as f32) as u32;
+    let y = (rect.y as f32 + delta[1])
+        .round()
+        .clamp(0., dimensions.1.saturating_sub(rect.h) as f32) as u32;
+    edit::PixelRect { x, y, ..rect }
+}
+
+/// Move from the press-time rect and point: total delta, not per-frame deltas.
+fn moved_crop(
+    origin: edit::PixelRect,
+    anchor: [f32; 2],
+    point: [f32; 2],
+    dimensions: (u32, u32),
+) -> edit::PixelRect {
+    translate_crop(
+        origin,
+        [point[0] - anchor[0], point[1] - anchor[1]],
+        dimensions,
+    )
+}
+
+/// Resize from the press-time rect by the pointer's total image-space delta.
+///
+/// Handles may be drawn outside a small rect, so the pointer position itself is
+/// never taken as the new boundary: only its displacement moves the edges. That
+/// keeps the first drag frame from jumping by the outward offset.
+fn resize_crop(
+    rect: edit::PixelRect,
+    handle: CropHandle,
+    delta: [f32; 2],
+    dimensions: (u32, u32),
+) -> edit::PixelRect {
+    let mut left = rect.x as f32;
+    let mut top = rect.y as f32;
+    let mut right = (rect.x + rect.w) as f32;
+    let mut bottom = (rect.y + rect.h) as f32;
+    let dx = delta[0];
+    let dy = delta[1];
+    let clamp_x = |value: f32| value.clamp(0., dimensions.0 as f32);
+    let clamp_y = |value: f32| value.clamp(0., dimensions.1 as f32);
+    match handle {
+        CropHandle::NorthWest => {
+            left = clamp_x(left + dx);
+            top = clamp_y(top + dy);
+        }
+        CropHandle::North => top = clamp_y(top + dy),
+        CropHandle::NorthEast => {
+            right = clamp_x(right + dx);
+            top = clamp_y(top + dy);
+        }
+        CropHandle::East => right = clamp_x(right + dx),
+        CropHandle::SouthEast => {
+            right = clamp_x(right + dx);
+            bottom = clamp_y(bottom + dy);
+        }
+        CropHandle::South => bottom = clamp_y(bottom + dy),
+        CropHandle::SouthWest => {
+            left = clamp_x(left + dx);
+            bottom = clamp_y(bottom + dy);
+        }
+        CropHandle::West => left = clamp_x(left + dx),
+    }
+    if right - left < 1. {
+        if matches!(
+            handle,
+            CropHandle::West | CropHandle::NorthWest | CropHandle::SouthWest
+        ) {
+            right = (left + 1.).min(dimensions.0 as f32);
+            left = right - 1.;
+        } else {
+            left = (right - 1.).max(0.);
+            right = left + 1.;
+        }
+    }
+    if bottom - top < 1. {
+        if matches!(
+            handle,
+            CropHandle::North | CropHandle::NorthWest | CropHandle::NorthEast
+        ) {
+            bottom = (top + 1.).min(dimensions.1 as f32);
+            top = bottom - 1.;
+        } else {
+            top = (bottom - 1.).max(0.);
+            bottom = top + 1.;
+        }
+    }
+    let resized = edit::PixelRect {
+        x: left.round() as u32,
+        y: top.round() as u32,
+        w: (right - left).round().max(1.) as u32,
+        h: (bottom - top).round().max(1.) as u32,
+    };
+    edit::clamp_crop(resized, dimensions.0, dimensions.1).unwrap_or(rect)
 }
 
 // One worker and one replaceable pending request bound decoding and rotation memory.
@@ -681,7 +1120,7 @@ fn prepare(work: Work, cancelled: &AtomicBool) -> WorkResult {
         };
     }
     match work {
-        Work::Load(path, prefetch, foreground, cap, mode, spread, language) => {
+        Work::Load(path, prefetch, foreground, cap, mode, spread, language, turns) => {
             // Scan even when decoding fails, so a corrupt first file does not trap navigation.
             let siblings = match &path {
                 SourceRef::File(file) => model::sibling_images(file)
@@ -726,9 +1165,9 @@ fn prepare(work: Work, cancelled: &AtomicBool) -> WorkResult {
                     }
                 }
                 if mode == ReadingMode::Book {
-                    prepare_spread(media, &[0], 0, true, cap, cancelled)
+                    prepare_spread(media, &[0], turns, true, cap, cancelled)
                 } else {
-                    prepare_frame(clicked, 0, 0, true, cap, cancelled)
+                    prepare_frame(clicked, 0, turns, true, cap, cancelled)
                 }
             })();
             WorkResult {
@@ -798,6 +1237,8 @@ struct Palette {
     border: Color32,
     accent: Color32,
     accent_bg: Color32,
+    warning: Color32,
+    warning_bg: Color32,
     error: Color32,
     error_bg: Color32,
 }
@@ -813,6 +1254,8 @@ impl Palette {
                 border: Color32::from_rgb(0x32, 0x3d, 0x44),
                 accent: Color32::from_rgb(0xb8, 0xd3, 0xff),
                 accent_bg: Color32::from_rgb(0x2b, 0x43, 0x64),
+                warning: Color32::from_rgb(0xef, 0xcf, 0x9a),
+                warning_bg: Color32::from_rgb(0x3b, 0x32, 0x23),
                 error: Color32::from_rgb(0xff, 0xc9, 0xbf),
                 error_bg: Color32::from_rgb(0x46, 0x2f, 0x2e),
             },
@@ -824,6 +1267,8 @@ impl Palette {
                 border: Color32::from_rgb(0xdd, 0xe3, 0xe8),
                 accent: Color32::from_rgb(0x24, 0x4f, 0x87),
                 accent_bg: Color32::from_rgb(0xe4, 0xed, 0xfc),
+                warning: Color32::from_rgb(0x7a, 0x52, 0x00),
+                warning_bg: Color32::from_rgb(0xff, 0xf4, 0xdc),
                 error: Color32::from_rgb(0x8b, 0x30, 0x29),
                 error_bg: Color32::from_rgb(0xff, 0xea, 0xe6),
             },
@@ -875,29 +1320,141 @@ fn action_button(
     palette: Palette,
     hint: &str,
 ) -> bool {
-    let text =
-        RichText::new(label)
-            .size(12.5)
-            .color(if active { palette.accent } else { palette.text });
-    let button = egui::Button::new(text)
-        .fill(if active {
-            palette.accent_bg
-        } else {
-            palette.surface
-        })
-        .stroke(Stroke::new(
-            1.,
-            if active {
-                palette.accent
-            } else {
-                palette.border
-            },
-        ))
+    tone_button(
+        ui,
+        label,
+        enabled,
+        active,
+        palette,
+        hint,
+        ButtonTone::Normal,
+    )
+}
+
+/// Destructive actions (overwrite save) keep their own colour so they never
+/// read as the ordinary forward path.
+fn danger_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    enabled: bool,
+    palette: Palette,
+    hint: &str,
+) -> bool {
+    tone_button(ui, label, enabled, false, palette, hint, ButtonTone::Danger)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ButtonTone {
+    Normal,
+    Danger,
+}
+
+fn tone_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    enabled: bool,
+    active: bool,
+    palette: Palette,
+    hint: &str,
+    tone: ButtonTone,
+) -> bool {
+    // egui fades non-interactive widgets to `disabled_alpha` (0.5); starting
+    // from full-strength text keeps a disabled button readable instead of faint.
+    let (text_color, fill, stroke) = match tone {
+        ButtonTone::Danger if enabled => (palette.error, palette.error_bg, palette.error),
+        ButtonTone::Danger => (palette.text, palette.canvas, palette.border),
+        ButtonTone::Normal if !enabled => (palette.text, palette.canvas, palette.border),
+        ButtonTone::Normal if active => (palette.accent, palette.accent_bg, palette.accent),
+        ButtonTone::Normal => (palette.text, palette.surface, palette.border),
+    };
+    let button = egui::Button::new(RichText::new(label).size(12.5).color(text_color))
+        .fill(fill)
+        .stroke(Stroke::new(1., stroke))
         .corner_radius(6.)
         .min_size(egui::vec2(34., 28.));
-    ui.add_enabled(enabled, button)
+    // `on_hover_text` also sets the accessible description and covers the
+    // enabled case; `on_disabled_hover_text` supplies the visible tooltip that
+    // egui otherwise suppresses on a disabled widget.
+    let response = ui
+        .add_enabled(enabled, button)
         .on_hover_text(hint)
-        .clicked()
+        .on_disabled_hover_text(hint);
+    if enabled && !active && response.hovered() {
+        ui.painter().rect_stroke(
+            response.rect,
+            6.,
+            Stroke::new(
+                1.,
+                match tone {
+                    ButtonTone::Danger => palette.error,
+                    ButtonTone::Normal => palette.accent,
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+    }
+    response.clicked()
+}
+
+/// One rounded shell holding the crop ratio presets, so six choices cost one
+/// compact block instead of six separate buttons.
+fn aspect_segments(
+    ui: &mut egui::Ui,
+    options: &[(CropAspect, &str)],
+    selected: CropAspect,
+    enabled: bool,
+    palette: Palette,
+    hint: &str,
+) -> Option<CropAspect> {
+    let mut picked = None;
+    EguiFrame::new()
+        .fill(palette.canvas)
+        .stroke(Stroke::new(1., palette.border))
+        .corner_radius(7.)
+        .inner_margin(Margin::symmetric(2, 2))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.;
+            ui.spacing_mut().button_padding = egui::vec2(7., 2.);
+            ui.horizontal(|ui| {
+                for &(value, label) in options {
+                    let active = value == selected;
+                    let (color, fill) = if !enabled {
+                        (palette.text, palette.canvas)
+                    } else if active {
+                        (palette.accent, palette.accent_bg)
+                    } else {
+                        (palette.muted, palette.canvas)
+                    };
+                    let button = egui::Button::new(RichText::new(label).size(11.5).color(color))
+                        .fill(fill)
+                        .stroke(Stroke::new(
+                            1.,
+                            if active {
+                                palette.accent
+                            } else {
+                                Color32::TRANSPARENT
+                            },
+                        ))
+                        .corner_radius(5.)
+                        .min_size(egui::vec2(0., 22.));
+                    let response = ui.add_enabled(enabled, button);
+                    if enabled && response.hovered() && !active {
+                        ui.painter().rect_stroke(
+                            response.rect,
+                            5.,
+                            Stroke::new(1., palette.accent),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    if response.clicked() {
+                        picked = Some(value);
+                    }
+                }
+            });
+        })
+        .response
+        .on_hover_text(hint);
+    picked
 }
 
 fn rect_from(rect: [f64; 4]) -> Rect {
@@ -914,6 +1471,11 @@ fn fit_rect(source: Vec2, bounds: Rect) -> Rect {
     let scale = (bounds.width() / source.x).min(bounds.height() / source.y);
     let size = source * scale;
     Rect::from_center_size(bounds.center(), size)
+}
+
+/// Same colour with an explicit alpha, for overlays that must not hide pixels.
+fn translucent(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1158,6 +1720,9 @@ struct Oxeye {
     animation_job: bool,
     epoch: Instant,
     rotation: Rotation,
+    edit_ui: Option<EditUi>,
+    edit_pending: Option<PendingEdit>,
+    close_after_save: bool,
     loading_file: bool,
     error: Option<String>,
     zoom: Zoom,
@@ -1264,6 +1829,9 @@ impl Oxeye {
             animation_job: false,
             epoch: Instant::now(),
             rotation: Rotation::default(),
+            edit_ui: None,
+            edit_pending: None,
+            close_after_save: false,
             loading_file: false,
             error: None,
             zoom: Zoom::Fit,
@@ -1442,7 +2010,11 @@ impl Oxeye {
     }
 
     fn open_settings(&mut self, ctx: &egui::Context) {
-        if self.settings_draft.is_some() || self.close_state.requested {
+        if self.settings_draft.is_some()
+            || self.close_state.requested
+            || self.editing()
+            || self.edit_pending.is_some()
+        {
             return;
         }
         self.cancel_navigation();
@@ -1510,7 +2082,10 @@ impl Oxeye {
     }
 
     fn toggle_reading_mode(&mut self, ctx: &egui::Context) {
-        if self.settings_draft.is_some() || self.close_state.requested {
+        if self.edit_pending.is_some() {
+            self.cancel_pending_edit(ctx);
+        }
+        if self.settings_draft.is_some() || self.close_state.requested || self.editing() {
             return;
         }
         let mode = toggled_reading_mode(self.settings.reading_mode);
@@ -1558,7 +2133,10 @@ impl Oxeye {
     }
 
     fn toggle_wide_page(&mut self, ctx: &egui::Context) {
-        if self.settings_draft.is_some() || self.close_state.requested {
+        if self.edit_pending.is_some() {
+            self.cancel_pending_edit(ctx);
+        }
+        if self.settings_draft.is_some() || self.close_state.requested || self.editing() {
             return;
         }
         let Some(position) = self.position() else {
@@ -1603,6 +2181,9 @@ impl Oxeye {
     }
 
     fn toggle_previews(&mut self, ctx: &egui::Context) {
+        if self.editing() || self.edit_pending.is_some() {
+            return;
+        }
         self.settings.thumbnails_visible = !self.settings.thumbnails_visible;
         if self.settings.thumbnails_visible {
             self.reveal_thumbnails();
@@ -1793,7 +2374,10 @@ impl Oxeye {
     }
 
     fn enqueue_navigation(&mut self, action: Navigation, ctx: &egui::Context) {
-        if self.close_state.requested || self.settings_draft.is_some() {
+        if self.edit_pending.is_some() {
+            self.cancel_pending_edit(ctx);
+        }
+        if self.close_state.requested || self.settings_draft.is_some() || self.editing() {
             return;
         }
         if self.navigation.is_idle() {
@@ -1901,6 +2485,10 @@ impl Oxeye {
 
     /// Dimensions of the pages that were just committed, in display order.
     fn record_page_dimensions(&mut self) {
+        // Preview pixels are not the disk truth; a page write would poison Book layout.
+        if self.edit_ui.is_some() {
+            return;
+        }
         for media in self.displayed_media() {
             let Some(frame) = media.frames.first() else {
                 continue;
@@ -2022,6 +2610,9 @@ impl Oxeye {
         if self.close_state.requested {
             return;
         }
+        if self.edit_pending.is_some() {
+            self.cancel_pending_edit(ctx);
+        }
         self.cancel_navigation();
         self.loader.cancel();
         self.candidate = None;
@@ -2111,6 +2702,11 @@ impl Oxeye {
     }
 
     fn load(&mut self, ctx: &egui::Context, path: SourceRef, queued: bool) {
+        self.load_with_turns(ctx, path, queued, 0);
+    }
+
+    /// `turns` restores an edit-exit rotation without changing normal browsing.
+    fn load_with_turns(&mut self, ctx: &egui::Context, path: SourceRef, queued: bool, turns: u8) {
         if self.close_state.requested || self.reject_changed_archive(&path, ctx) {
             return;
         }
@@ -2161,6 +2757,7 @@ impl Oxeye {
             self.settings.reading_mode,
             spread,
             self.language,
+            turns,
         ));
         self.start_work(ctx);
         self.sync_prefetch(ctx);
@@ -2380,7 +2977,7 @@ impl Oxeye {
                 }
                 self.navigation.retarget(pages[0], &layout);
                 let revision = self.loader.revision;
-                self.load(ctx, source.clone(), true);
+                self.load_with_turns(ctx, source.clone(), true, prepared.turns);
                 if self.loader.revision != revision {
                     self.layout_retry = Some((source, pages));
                 } else {
@@ -2535,7 +3132,7 @@ impl Oxeye {
     }
 
     fn toggle_playback(&mut self, ctx: &egui::Context) {
-        if self.loading_file || !self.has_animation() {
+        if self.loading_file || !self.has_animation() || self.editing() {
             return;
         }
         let now = self.epoch.elapsed();
@@ -2572,6 +3169,9 @@ impl Oxeye {
     }
 
     fn open(&mut self, ctx: &egui::Context) {
+        if self.editing() || self.edit_pending.is_some() {
+            return;
+        }
         self.cancel_navigation();
         if let Some(path) = rfd::FileDialog::new()
             .set_title(self.text().open_picker_title)
@@ -2711,7 +3311,814 @@ impl Oxeye {
         self.set_feedback(FeedbackKind::Success, message.to_owned(), ctx);
     }
 
+    fn editing(&self) -> bool {
+        self.edit_ui.is_some()
+    }
+
+    fn request_edit(&mut self, crop: bool, ctx: &egui::Context) {
+        if self.editing()
+            || self.edit_pending.is_some()
+            || self.settings_draft.is_some()
+            || self.close_state.requested
+            || self.busy()
+            || self.loading_file
+            || self.tiled.is_none()
+        {
+            return;
+        }
+        let (Some(selected), Some(displayed), Some(media)) = (
+            self.selected.clone(),
+            self.displayed.clone(),
+            self.media.clone(),
+        ) else {
+            return;
+        };
+        // A failed load moves `selected` but keeps the old `media`; never mix them.
+        if selected != displayed || selected != media.source {
+            self.set_feedback(
+                FeedbackKind::Error,
+                self.text().edit_source_mismatch.to_owned(),
+                ctx,
+            );
+            return;
+        }
+        let book_transition = self.display_mode == ReadingMode::Book
+            || self.settings.reading_mode == ReadingMode::Book;
+        // In Book the transition lands on the explicitly requested page, which
+        // can be the other half of the current spread; edit that page, not the anchor.
+        let source = if book_transition {
+            mode_target(&self.current_file, &self.selected, &self.displayed)
+                .unwrap_or_else(|| media.source.clone())
+        } else {
+            media.source.clone()
+        };
+        if editable_format(&source).is_none() {
+            self.set_feedback(
+                FeedbackKind::Error,
+                self.text().edit_unsupported_format.to_owned(),
+                ctx,
+            );
+            return;
+        }
+        let target_media = if source == media.source {
+            Some(media.clone())
+        } else {
+            self.other_pages
+                .iter()
+                .find(|page| page.media.source == source)
+                .map(|page| page.media.clone())
+        };
+        let Some(target_media) = target_media else {
+            self.set_feedback(
+                FeedbackKind::Error,
+                self.text().edit_source_mismatch.to_owned(),
+                ctx,
+            );
+            return;
+        };
+        if target_media.frames.len() != 1 || target_media.loop_mode != model::LoopMode::Once {
+            self.set_feedback(
+                FeedbackKind::Error,
+                self.text().edit_single_frame.to_owned(),
+                ctx,
+            );
+            return;
+        }
+        if book_transition {
+            let pending = PendingEdit {
+                source,
+                rotation: self.rotation,
+                restore: ReadingMode::Book,
+                selected: self.selected.clone(),
+                displayed: self.displayed.clone(),
+                current_file: self.current_file.clone(),
+                crop,
+            };
+            if self.transition_to_mode(ReadingMode::Single, ctx) {
+                self.edit_pending = Some(pending);
+            }
+            return;
+        }
+        self.begin_edit(ctx, self.rotation, None, source, crop);
+    }
+
+    /// Snapshots the single displayed frame, bakes the shown rotation, and
+    /// replaces the view with the preview through the normal commit path.
+    fn begin_edit(
+        &mut self,
+        ctx: &egui::Context,
+        rotation: Rotation,
+        restore: Option<ReadingMode>,
+        source: SourceRef,
+        crop: bool,
+    ) {
+        let Some(media) = self.media.clone() else {
+            return;
+        };
+        if media.source != source {
+            return;
+        }
+        let Some(frame) = media.frames.first().map(|frame| Arc::clone(&frame.pixels)) else {
+            return;
+        };
+        let session = match edit::EditSession::start(frame, rotation.displayed) {
+            Ok(session) => session,
+            Err(error) => {
+                let message = edit_error_text(self.text(), error);
+                self.set_feedback(FeedbackKind::Error, message, ctx);
+                return;
+            }
+        };
+        self.cancel_navigation();
+        self.pause_animation();
+        self.candidate = None;
+        self.rotation.commit(0);
+        self.edit_ui = Some(EditUi {
+            session,
+            source,
+            original_media: media,
+            original_tiled: self.tiled.clone(),
+            original_rotation: rotation,
+            restore_mode: restore,
+            crop: None,
+            confirm: None,
+            saving: None,
+            quality: export::JPEG_QUALITY_DEFAULT,
+        });
+        self.commit_edit_preview(ctx);
+        if crop {
+            self.enter_crop();
+        }
+    }
+
+    /// Abandons a Book -> Single transition and restores the pre-request view.
+    fn cancel_pending_edit(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.edit_pending.take() else {
+            return;
+        };
+        let committed = self
+            .media
+            .as_ref()
+            .is_some_and(|media| media.source == pending.source)
+            && self.display_mode == ReadingMode::Single;
+        self.candidate = None;
+        self.loader.cancel();
+        self.loading_file = false;
+        self.nav = None;
+        self.settings.reading_mode = pending.restore;
+        if committed {
+            // The Single frame already committed; rebuild the Book view from
+            // the same page instead of only relabeling a single-page state.
+            self.display_mode = pending.restore;
+            self.rotation = pending.rotation;
+            self.selected = Some(pending.source.clone());
+            self.displayed = Some(pending.source.clone());
+            self.current_file = Some(pending.source.clone());
+            self.sync_prefetch(ctx);
+            let turns = pending.rotation.displayed;
+            self.load_with_turns(ctx, pending.source, false, turns);
+        } else {
+            self.display_mode = pending.restore;
+            self.selected = pending.selected;
+            self.displayed = pending.displayed;
+            self.current_file = pending.current_file;
+            self.rotation.cancel();
+            self.sync_prefetch(ctx);
+        }
+        ctx.request_repaint();
+    }
+
+    /// Puts the edited pixels on screen without claiming they are the file on disk.
+    fn commit_edit_preview(&mut self, ctx: &egui::Context) {
+        let Some(edit) = self.edit_ui.as_ref() else {
+            return;
+        };
+        let source = edit.source.clone();
+        let pixels = Arc::clone(edit.session.preview());
+        let media = Arc::new(model::LoadedMedia {
+            source,
+            frames: vec![model::MediaFrame {
+                pixels,
+                delay: Duration::ZERO,
+            }],
+            loop_mode: model::LoopMode::Once,
+        });
+        let cancelled = AtomicBool::new(false);
+        let prepared = prepare_frame(media, 0, 0, false, self.tile_cap(ctx), &cancelled);
+        match prepared {
+            Ok(prepared) => {
+                self.candidate = Some(Candidate {
+                    revision: self.loader.revision,
+                    image: prepared,
+                    painted_frame: None,
+                });
+                self.commit_candidate(ctx);
+            }
+            Err(error) => {
+                let message = self.text().edit_failed(&error);
+                self.set_feedback(FeedbackKind::Error, message, ctx);
+            }
+        }
+        self.sync_prefetch(ctx);
+        ctx.request_repaint();
+    }
+
+    fn apply_edit_op(&mut self, op: edit::EditOp, ctx: &egui::Context) {
+        let result = self.edit_ui.as_mut().and_then(|edit| {
+            if edit.confirm.is_some() || edit.saving.is_some() {
+                None
+            } else {
+                Some(edit.session.apply(op))
+            }
+        });
+        match result {
+            Some(Ok(())) => {
+                // A successful op can change dimensions; a stale crop box would lie.
+                if let Some(edit) = self.edit_ui.as_mut() {
+                    edit.crop = None;
+                }
+                self.commit_edit_preview(ctx);
+            }
+            Some(Err(error)) => {
+                let message = edit_error_text(self.text(), error);
+                self.set_feedback(FeedbackKind::Error, message, ctx);
+            }
+            None => {}
+        }
+    }
+
+    fn undo_edit(&mut self, ctx: &egui::Context) {
+        let undone = self.edit_ui.as_mut().is_some_and(|edit| {
+            edit.confirm.is_none() && edit.saving.is_none() && edit.session.undo()
+        });
+        if undone {
+            if let Some(edit) = self.edit_ui.as_mut() {
+                edit.crop = None;
+            }
+            self.commit_edit_preview(ctx);
+        }
+    }
+
+    fn crop_active(&self) -> bool {
+        self.edit_ui
+            .as_ref()
+            .is_some_and(|edit| edit.crop.is_some())
+    }
+
+    fn crop_layer(
+        &mut self,
+        ctx: &egui::Context,
+        response: &egui::Response,
+        painter: &egui::Painter,
+        viewport: Rect,
+        palette: Palette,
+    ) {
+        let dpi = ctx.pixels_per_point();
+        let handle_size = crop_handle_size(dpi);
+        let dimensions = self.dimensions;
+        let scale = self.scale_for(self.zoom, dimensions, viewport.size(), dpi);
+        let transform = viewer::CanvasTransform::new(
+            [viewport.center().x, viewport.center().y],
+            dimensions,
+            scale,
+            self.pan,
+            dpi,
+        );
+        let to_image = |pos: Pos2| viewer::screen_to_image(transform, [pos.x, pos.y]);
+        let screen_rect = |rect: edit::PixelRect| {
+            viewer::image_rect_to_screen(
+                transform,
+                [rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32],
+            )
+        };
+        let Some(crop) = self.edit_ui.as_mut().and_then(|edit| edit.crop.as_mut()) else {
+            return;
+        };
+        let hold = crop.aspect.ratio(dimensions);
+        if response.drag_started_by(PointerButton::Primary)
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let screen = screen_rect(crop.rect);
+            let drawn = Rect::from_min_size(
+                Pos2::new(screen[0], screen[1]),
+                egui::vec2(screen[2], screen[3]),
+            );
+            if let Some(handle) = crop_handle_at(screen, pos, handle_size) {
+                crop.drag = Some(CropDrag::Resize {
+                    handle,
+                    origin: crop.rect,
+                    anchor: to_image(pos),
+                });
+            } else if drawn.contains(pos) {
+                crop.drag = Some(CropDrag::Move {
+                    origin: crop.rect,
+                    anchor: to_image(pos),
+                });
+            } else {
+                let anchor = to_image(pos);
+                crop.drag = Some(CropDrag::New { anchor });
+                crop.rect = edit::aspect_fit(
+                    crop_rect_from_points(anchor, anchor, dimensions),
+                    hold,
+                    dimensions,
+                );
+            }
+        }
+        if response.dragged_by(PointerButton::Primary)
+            && let (Some(drag), Some(pos)) = (crop.drag, response.interact_pointer_pos())
+        {
+            let point = to_image(pos);
+            crop.rect = match drag {
+                CropDrag::New { anchor } => edit::aspect_fit(
+                    crop_rect_from_points(anchor, point, dimensions),
+                    hold,
+                    dimensions,
+                ),
+                CropDrag::Move { origin, anchor } => moved_crop(origin, anchor, point, dimensions),
+                CropDrag::Resize {
+                    handle,
+                    origin,
+                    anchor,
+                } => edit::aspect_fit(
+                    resize_crop(
+                        origin,
+                        handle,
+                        [point[0] - anchor[0], point[1] - anchor[1]],
+                        dimensions,
+                    ),
+                    hold,
+                    dimensions,
+                ),
+            };
+        }
+        if response.drag_stopped_by(PointerButton::Primary) {
+            crop.drag = None;
+        }
+        if response.double_clicked_by(PointerButton::Primary) {
+            crop.rect = edit::aspect_fit(
+                edit::PixelRect {
+                    x: 0,
+                    y: 0,
+                    w: dimensions.0,
+                    h: dimensions.1,
+                },
+                hold,
+                dimensions,
+            );
+            crop.drag = None;
+        }
+
+        let screen = screen_rect(crop.rect);
+        let drawn = Rect::from_min_size(
+            Pos2::new(screen[0], screen[1]),
+            egui::vec2(screen[2], screen[3]),
+        );
+        let dragging = crop.drag.is_some();
+        let active_handle = match crop.drag {
+            Some(CropDrag::Resize { handle, .. }) => Some(handle),
+            _ => None,
+        };
+        // Dim what is discarded; the selection itself is never filled over.
+        let shade = Color32::from_black_alpha(if dragging { 104 } else { 120 });
+        let clamp_x = |x: f32| x.clamp(viewport.left(), viewport.right());
+        let clamp_y = |y: f32| y.clamp(viewport.top(), viewport.bottom());
+        let bands = [
+            Rect::from_min_max(
+                viewport.min,
+                Pos2::new(viewport.max.x, clamp_y(drawn.top())),
+            ),
+            Rect::from_min_max(
+                Pos2::new(viewport.min.x, clamp_y(drawn.bottom())),
+                viewport.max,
+            ),
+            Rect::from_min_max(
+                Pos2::new(viewport.min.x, drawn.top().max(viewport.top())),
+                Pos2::new(clamp_x(drawn.left()), drawn.bottom().min(viewport.bottom())),
+            ),
+            Rect::from_min_max(
+                Pos2::new(clamp_x(drawn.right()), drawn.top().max(viewport.top())),
+                Pos2::new(viewport.max.x, drawn.bottom().min(viewport.bottom())),
+            ),
+        ];
+        for band in bands {
+            if band.width() > 0. && band.height() > 0. {
+                painter.rect_filled(band, 0., shade);
+            }
+        }
+        // Dark halo plus an accent hairline: one of the two always separates the
+        // frame from a white or a black image.
+        painter.rect_stroke(
+            drawn,
+            0.,
+            Stroke::new(3., Color32::from_black_alpha(150)),
+            egui::StrokeKind::Outside,
+        );
+        painter.rect_stroke(
+            drawn,
+            0.,
+            Stroke::new(1.5, palette.accent),
+            egui::StrokeKind::Inside,
+        );
+        if drawn.width() > 48. && drawn.height() > 48. {
+            // Thirds help composition at rest and get out of the way while the
+            // pointer is already dragging a handle.
+            let alpha = if dragging { 0.25 } else { 0.5 };
+            for third in 1..3 {
+                let x = drawn.left() + drawn.width() * third as f32 / 3.;
+                let y = drawn.top() + drawn.height() * third as f32 / 3.;
+                painter.line_segment(
+                    [Pos2::new(x, drawn.top()), Pos2::new(x, drawn.bottom())],
+                    Stroke::new(1., palette.accent.gamma_multiply(alpha)),
+                );
+                painter.line_segment(
+                    [Pos2::new(drawn.left(), y), Pos2::new(drawn.right(), y)],
+                    Stroke::new(1., palette.accent.gamma_multiply(alpha)),
+                );
+            }
+        }
+        for (handle, center) in crop_handle_points(screen, handle_size) {
+            let focused = active_handle == Some(handle);
+            let size = if focused {
+                handle_size + 2.
+            } else {
+                handle_size
+            };
+            let square = Rect::from_center_size(center, egui::vec2(size, size));
+            painter.rect_filled(
+                square,
+                2.,
+                if focused {
+                    palette.text
+                } else {
+                    palette.accent
+                },
+            );
+            painter.rect_stroke(
+                square,
+                2.,
+                Stroke::new(1., Color32::from_black_alpha(130)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if response.hovered() || response.dragged() {
+            let icon = if crop.drag.is_some() || response.dragged() {
+                CursorIcon::Grabbing
+            } else if let Some(pos) = response.hover_pos() {
+                if let Some(handle) = crop_handle_at(screen, pos, handle_size) {
+                    crop_cursor(handle)
+                } else if drawn.contains(pos) {
+                    CursorIcon::Grab
+                } else {
+                    CursorIcon::Crosshair
+                }
+            } else {
+                CursorIcon::Crosshair
+            };
+            ctx.set_cursor_icon(icon);
+        }
+    }
+
+    /// Restores the pre-edit frame and layout; edited pixels are never written here.
+    fn exit_edit(&mut self, ctx: &egui::Context) {
+        if self
+            .edit_ui
+            .as_ref()
+            .is_some_and(|edit| edit.saving.is_some())
+        {
+            return;
+        }
+        let Some(edit) = self.edit_ui.take() else {
+            return;
+        };
+        let dirty = edit.session.dirty();
+        let source = edit.source.clone();
+        let turns = edit.original_rotation.displayed;
+        self.candidate = None;
+        self.cancel_navigation();
+        self.rotation = edit.original_rotation;
+        self.media = Some(edit.original_media);
+        self.tiled = edit.original_tiled;
+        self.other_pages.clear();
+        self.frame = 0;
+        self.selected = Some(source.clone());
+        self.displayed = Some(source.clone());
+        self.current_file = Some(source.clone());
+        self.dimensions = self
+            .tiled
+            .as_ref()
+            .map(|tiled| tiled.dimensions)
+            .unwrap_or((0, 0));
+        self.display_mode = self.settings.reading_mode;
+        if let Some(mode) = edit.restore_mode {
+            self.settings.reading_mode = mode;
+            self.sync_prefetch(ctx);
+            self.load_with_turns(ctx, source, false, turns);
+        } else {
+            self.sync_prefetch(ctx);
+        }
+        if dirty {
+            self.set_feedback(
+                FeedbackKind::Success,
+                self.text().edit_discarded.to_owned(),
+                ctx,
+            );
+        }
+        ctx.request_repaint();
+    }
+
+    fn enter_crop(&mut self) {
+        let dimensions = self.dimensions;
+        let Some(edit) = self.edit_ui.as_mut() else {
+            return;
+        };
+        if edit.session.preview().width() == 0 || edit.session.preview().height() == 0 {
+            return;
+        }
+        let rect = edit::PixelRect {
+            x: 0,
+            y: 0,
+            w: dimensions.0,
+            h: dimensions.1,
+        };
+        edit.crop = Some(CropState {
+            rect,
+            aspect: CropAspect::Free,
+            drag: None,
+        });
+    }
+
+    fn set_crop_aspect(&mut self, aspect: CropAspect) {
+        let dimensions = self.dimensions;
+        let Some(crop) = self.edit_ui.as_mut().and_then(|edit| edit.crop.as_mut()) else {
+            return;
+        };
+        crop.aspect = aspect;
+        crop.rect = edit::aspect_fit(crop.rect, aspect.ratio(dimensions), dimensions);
+    }
+
+    fn apply_crop(&mut self, ctx: &egui::Context) {
+        if self
+            .edit_ui
+            .as_ref()
+            .is_some_and(|edit| edit.confirm.is_some() || edit.saving.is_some())
+        {
+            return;
+        }
+        let rect = self
+            .edit_ui
+            .as_mut()
+            .and_then(|edit| edit.crop.take())
+            .map(|crop| crop.rect);
+        if let Some(rect) = rect {
+            self.apply_edit_op(edit::EditOp::Crop(rect), ctx);
+        }
+    }
+
+    fn request_save_overwrite(&mut self, ctx: &egui::Context) {
+        let Some(edit) = self.edit_ui.as_ref() else {
+            return;
+        };
+        if edit.confirm.is_some() {
+            return;
+        }
+        if edit.saving.is_some() {
+            self.set_feedback(
+                FeedbackKind::Progress,
+                self.text().saving_image.to_owned(),
+                ctx,
+            );
+            return;
+        }
+        let Some(source) = self.edit_ui.as_ref().map(|edit| edit.source.clone()) else {
+            return;
+        };
+        if source.is_archive() {
+            self.set_feedback(
+                FeedbackKind::Error,
+                self.text().archive_cannot_overwrite.to_owned(),
+                ctx,
+            );
+            return;
+        }
+        let path = source.path().to_path_buf();
+        let Some(format) = export::format_for_path(&path) else {
+            self.set_feedback(
+                FeedbackKind::Error,
+                self.text().edit_unsupported_format.to_owned(),
+                ctx,
+            );
+            return;
+        };
+        if let Some(edit) = self.edit_ui.as_mut() {
+            edit.confirm = Some(SaveConfirm {
+                path,
+                format,
+                overwrite: true,
+            });
+        }
+    }
+
+    fn save_as(&mut self, ctx: &egui::Context) {
+        let Some(edit) = self.edit_ui.as_ref() else {
+            return;
+        };
+        if edit.confirm.is_some() {
+            return;
+        }
+        if edit.saving.is_some() {
+            self.set_feedback(
+                FeedbackKind::Progress,
+                self.text().saving_image.to_owned(),
+                ctx,
+            );
+            return;
+        }
+        let source = edit.source.clone();
+        let name = export::default_file_name(&source.display_name());
+        let picked = rfd::FileDialog::new()
+            .set_title(self.text().save_as)
+            .set_file_name(name)
+            .add_filter("PNG", &["png"])
+            .add_filter("JPEG", &["jpg", "jpeg"])
+            .add_filter("WebP", &["webp"])
+            .add_filter("BMP", &["bmp"])
+            .save_file();
+        let Some(path) = picked else {
+            return;
+        };
+        let Some(format) = export::format_for_path(&path) else {
+            let message = self.text().unknown_save_format(&path.display().to_string());
+            self.set_feedback(FeedbackKind::Error, message, ctx);
+            return;
+        };
+        // Save As onto the frozen source is the overwrite transaction, never a
+        // plain copy that skips cache invalidation.
+        if same_save_target(&path, source.path()) {
+            if source.is_archive() {
+                self.set_feedback(
+                    FeedbackKind::Error,
+                    self.text().archive_cannot_overwrite.to_owned(),
+                    ctx,
+                );
+                return;
+            }
+            if let Some(edit) = self.edit_ui.as_mut() {
+                edit.confirm = Some(SaveConfirm {
+                    path,
+                    format,
+                    overwrite: true,
+                });
+            }
+            return;
+        }
+        let transparent = self
+            .edit_ui
+            .as_ref()
+            .is_some_and(|edit| export::has_transparency(edit.session.preview()));
+        if save_risk_reason(self.text(), format, transparent).is_some() {
+            if let Some(edit) = self.edit_ui.as_mut() {
+                edit.confirm = Some(SaveConfirm {
+                    path,
+                    format,
+                    overwrite: false,
+                });
+            }
+            return;
+        }
+        self.start_save(path, format, false, ctx);
+    }
+
+    fn start_save(
+        &mut self,
+        path: PathBuf,
+        format: export::ExportFormat,
+        overwrite: bool,
+        ctx: &egui::Context,
+    ) {
+        if self.close_state.requested {
+            self.set_feedback(
+                FeedbackKind::Error,
+                self.text().save_blocked_closing.to_owned(),
+                ctx,
+            );
+            return;
+        }
+        let Some(edit) = self.edit_ui.as_mut() else {
+            return;
+        };
+        if edit.saving.is_some() {
+            return;
+        }
+        let pixels = Arc::clone(edit.session.preview());
+        let quality = edit.quality;
+        let (sender, receiver) = mpsc::channel();
+        let repaint = ctx.clone();
+        let target = path.clone();
+        std::thread::spawn(move || {
+            let result = export::atomic_write(&target, &pixels, format, quality)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            repaint.request_repaint();
+        });
+        edit.saving = Some(SaveJob {
+            receiver,
+            overwrite,
+            path,
+        });
+        self.set_feedback(
+            FeedbackKind::Progress,
+            self.text().saving_image.to_owned(),
+            ctx,
+        );
+    }
+
+    fn poll_save(&mut self, ctx: &egui::Context) {
+        let Some(edit) = self.edit_ui.as_mut() else {
+            return;
+        };
+        let Some(job) = edit.saving.as_ref() else {
+            return;
+        };
+        let outcome = match job.receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err("save worker stopped".to_owned()),
+        };
+        let overwrite = job.overwrite;
+        let path = job.path.clone();
+        let source = edit.source.clone();
+        edit.saving = None;
+        let success = outcome.is_ok();
+        match outcome {
+            Ok(()) if overwrite => self.finish_overwrite(ctx),
+            Ok(()) => {
+                let mut message = self.text().saved_as(&path.display().to_string());
+                let same_directory =
+                    !source.is_archive() && source.path().parent() == path.parent();
+                if same_directory {
+                    message.push_str(self.text().reopen_folder);
+                }
+                self.set_feedback(FeedbackKind::Success, message, ctx);
+            }
+            Err(error) => {
+                let message = self.text().export_failed(&error);
+                self.set_feedback(FeedbackKind::Error, message, ctx);
+            }
+        }
+        // A close requested during the write waits for the result; failure keeps
+        // the window open so the user can retry.
+        if self.close_after_save {
+            self.close_after_save = false;
+            if success {
+                self.request_close(ctx);
+            }
+        }
+    }
+
+    /// After a successful overwrite the disk is the only truth: drop caches and re-decode.
+    fn finish_overwrite(&mut self, ctx: &egui::Context) {
+        let Some(edit) = self.edit_ui.take() else {
+            return;
+        };
+        let source = edit.source.clone();
+        self.prefetch.forget_paths(std::slice::from_ref(&source));
+        if let Some(index) = source_index(Some(&source), &self.siblings) {
+            self.page_dimensions.remove(&index);
+        }
+        self.thumb_generation = self.thumb_generation.wrapping_add(1);
+        self.thumb_textures.clear();
+        self.thumb_requests.clear();
+        self.thumb_visible.clear();
+        self.thumb_stable = 0;
+        self.settings.reading_mode = edit.restore_mode.unwrap_or(self.settings.reading_mode);
+        self.display_mode = self.settings.reading_mode;
+        // The edited page already contains its baked rotation on disk; reload
+        // it at turns=0. A Book spread is rebuilt as a whole, so applying the
+        // old turns there would rotate every page a second time.
+        self.load(ctx, source, false);
+        self.reveal_thumbnails();
+        self.set_feedback(FeedbackKind::Success, self.text().saved.to_owned(), ctx);
+    }
+
     fn perform(&mut self, action: Action, viewport: Rect, ctx: &egui::Context) {
+        if self.editing()
+            && matches!(
+                action,
+                Action::Previous
+                    | Action::Next
+                    | Action::JumpFiles(_)
+                    | Action::Pan { .. }
+                    | Action::Playback
+                    | Action::ToggleMode
+                    | Action::WideToggle
+                    | Action::First
+                    | Action::Last
+                    | Action::Open
+                    | Action::Settings
+            )
+        {
+            return;
+        }
         match action {
             Action::Previous => self.enqueue_navigation(Navigation::Previous, ctx),
             Action::Next => self.enqueue_navigation(Navigation::Next, ctx),
@@ -2730,8 +4137,16 @@ impl Oxeye {
                 ctx.request_repaint();
             }
             Action::RotateLeft | Action::RotateRight => {
-                if !self.loading_file && self.media.is_some() {
-                    self.rotation.request(matches!(action, Action::RotateRight));
+                let clockwise = matches!(action, Action::RotateRight);
+                if self.editing() {
+                    let op = if clockwise {
+                        edit::EditOp::RotateCw
+                    } else {
+                        edit::EditOp::RotateCcw
+                    };
+                    self.apply_edit_op(op, ctx);
+                } else if !self.loading_file && self.media.is_some() {
+                    self.rotation.request(clockwise);
                     self.error = None;
                     let now = self.epoch.elapsed();
                     if self.display_mode == ReadingMode::Book {
@@ -2757,6 +4172,26 @@ impl Oxeye {
             Action::Playback => self.toggle_playback(ctx),
             Action::Fullscreen => self.toggle_fullscreen(ctx),
             Action::Escape => {
+                if self.edit_pending.is_some() {
+                    self.cancel_pending_edit(ctx);
+                    return;
+                }
+                if let Some(edit) = self.edit_ui.as_mut() {
+                    if edit.confirm.is_some() {
+                        edit.confirm = None;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    if edit.crop.is_some() {
+                        edit.crop = None;
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+                if self.editing() {
+                    self.exit_edit(ctx);
+                    return;
+                }
                 if !self.navigation.is_idle() {
                     self.cancel_navigation();
                     self.sync_prefetch(ctx);
@@ -2773,6 +4208,35 @@ impl Oxeye {
             Action::Settings => self.open_settings(ctx),
             Action::ToggleMode => self.toggle_reading_mode(ctx),
             Action::WideToggle => self.toggle_wide_page(ctx),
+            Action::Edit => {
+                if self.editing() {
+                    let blocked = self
+                        .edit_ui
+                        .as_ref()
+                        .is_some_and(|edit| edit.confirm.is_some() || edit.saving.is_some());
+                    if !blocked {
+                        self.enter_crop();
+                    }
+                } else {
+                    self.request_edit(true, ctx);
+                }
+            }
+            Action::UndoEdit => self.undo_edit(ctx),
+            Action::FlipHorizontal => {
+                self.apply_edit_op(edit::EditOp::FlipHorizontal, ctx);
+            }
+            Action::FlipVertical => {
+                self.apply_edit_op(edit::EditOp::FlipVertical, ctx);
+            }
+            Action::SaveOverwrite => self.request_save_overwrite(ctx),
+            Action::SaveAs => self.save_as(ctx),
+            Action::CropApply => self.apply_crop(ctx),
+            Action::CropCancel => {
+                if let Some(edit) = self.edit_ui.as_mut() {
+                    edit.crop = None;
+                }
+            }
+            Action::EditExit => self.exit_edit(ctx),
         }
     }
 
@@ -2780,9 +4244,26 @@ impl Oxeye {
         if self.settings_draft.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
+        // A save confirmation owns the keyboard; only Esc (cancel) passes.
+        let confirming = self
+            .edit_ui
+            .as_ref()
+            .is_some_and(|edit| edit.confirm.is_some());
         let events = ctx.input(|input| input.events.clone());
         let mut acted = false;
         for event in events {
+            if confirming
+                && !matches!(
+                    &event,
+                    egui::Event::Key {
+                        key: Key::Escape,
+                        pressed: true,
+                        ..
+                    }
+                )
+            {
+                continue;
+            }
             // egui-winit consumes the native copy shortcut before emitting Key.
             if matches!(event, egui::Event::Copy) {
                 self.perform(Action::Copy, viewport, ctx);
@@ -2831,8 +4312,28 @@ impl Oxeye {
         }
     }
 
+    /// Defers closing until the running image save reports a result.
+    fn save_delays_close(&mut self, ctx: &egui::Context, native: bool) -> bool {
+        if !self
+            .edit_ui
+            .as_ref()
+            .is_some_and(|edit| edit.saving.is_some())
+        {
+            return false;
+        }
+        self.close_after_save = true;
+        if native {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        }
+        ctx.request_repaint();
+        true
+    }
+
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        if self.save_delays_close(ctx, true) {
             return;
         }
         self.cancel_navigation();
@@ -2865,6 +4366,9 @@ impl Oxeye {
     }
 
     fn request_close(&mut self, ctx: &egui::Context) {
+        if self.save_delays_close(ctx, false) {
+            return;
+        }
         self.cancel_navigation();
         let close = self.close_state.request(self.save_revision);
         let progress_error = if close {
@@ -3011,28 +4515,49 @@ impl Oxeye {
         let Some(notice) = self.feedback.notice.clone() else {
             return;
         };
-        let is_error = notice.kind == FeedbackKind::Error;
+        let (tone, background) = match notice.kind {
+            FeedbackKind::Error => (palette.error, palette.error_bg),
+            FeedbackKind::Success | FeedbackKind::Progress => (palette.accent, palette.accent_bg),
+        };
+        let progress = notice.kind == FeedbackKind::Progress;
         egui::Panel::top("notice-banner")
             .frame(
                 EguiFrame::new()
-                    .fill(if is_error {
-                        palette.error_bg
-                    } else {
-                        palette.accent_bg
-                    })
+                    .fill(background)
                     .inner_margin(Margin::symmetric(14, 7)),
             )
             .show(ui, |ui| {
                 ui.vertical(|ui| {
-                    ui.add(
-                        egui::Label::new(RichText::new(notice.text).size(12.).color(if is_error {
-                            palette.error
-                        } else {
-                            palette.accent
-                        }))
-                        .wrap(),
-                    );
-                    if is_error {
+                    ui.horizontal(|ui| {
+                        let (dot, _) = ui.allocate_exact_size(egui::vec2(6., 6.), Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 3., tone);
+                        ui.add(
+                            egui::Label::new(RichText::new(notice.text).size(12.).color(tone))
+                                .wrap(),
+                        );
+                    });
+                    if progress {
+                        // A running save cannot be cancelled: the bar only
+                        // reports that work is still going and offers no button.
+                        let (track, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width().max(80.), 3.),
+                            Sense::hover(),
+                        );
+                        ui.painter()
+                            .rect_filled(track, 1.5, tone.gamma_multiply(0.25));
+                        let phase = (ui.input(|input| input.time) * 0.8).rem_euclid(1.) as f32;
+                        let (start, end) = indeterminate_span(phase, track.width());
+                        ui.painter().rect_filled(
+                            Rect::from_min_max(
+                                Pos2::new(track.left() + start, track.top()),
+                                Pos2::new(track.left() + end, track.bottom()),
+                            ),
+                            1.5,
+                            tone,
+                        );
+                        ui.ctx().request_repaint();
+                    }
+                    if notice.kind == FeedbackKind::Error {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let text = self.text();
                             if action_button(
@@ -3052,7 +4577,7 @@ impl Oxeye {
     }
 
     fn preview_strip(&mut self, ui: &mut egui::Ui, palette: Palette) {
-        if !self.settings.thumbnails_visible {
+        if !self.settings.thumbnails_visible || self.editing() {
             return;
         }
         egui::Panel::bottom("previews")
@@ -3161,7 +4686,7 @@ impl Oxeye {
                         egui::StrokeKind::Inside,
                     );
                 }
-                if self.settings_draft.is_none() {
+                if self.settings_draft.is_none() && self.edit_pending.is_none() {
                     if response.hovered() {
                         let events = ui.ctx().input(|input| input.events.clone());
                         for event in events {
@@ -3895,6 +5420,378 @@ impl Oxeye {
             });
     }
 
+    fn edit_toolbar(&mut self, ui: &mut egui::Ui, palette: Palette) {
+        if !self.editing() {
+            return;
+        }
+        let text = self.text();
+        let Some(edit) = self.edit_ui.as_ref() else {
+            return;
+        };
+        let crop = edit.crop.as_ref().map(|crop| (crop.aspect, crop.rect));
+        let dirty = edit.session.dirty();
+        let archive = edit.source.is_archive();
+        let blocked = edit.saving.is_some() || edit.confirm.is_some();
+        let viewport = self.viewport;
+        let zoom_scale = self.scale_for(
+            self.zoom,
+            self.dimensions,
+            viewport.size(),
+            ui.ctx().pixels_per_point(),
+        );
+        // Groups stay in one wrapped row: transform, history, then output. The
+        // row never nests a right-to-left layout, so a narrow window wraps whole
+        // buttons in reading order instead of scattering them.
+        egui::Panel::top("edit-toolbar")
+            .frame(panel_frame(palette))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    // The mode stays visible in a clean crop too: the canvas
+                    // badge is hidden while cropping, so this is the anchor.
+                    let (dot, _) = ui.allocate_exact_size(egui::vec2(6., 6.), Sense::hover());
+                    ui.painter().circle_filled(
+                        dot.center(),
+                        3.,
+                        if dirty {
+                            palette.warning
+                        } else {
+                            palette.accent
+                        },
+                    );
+                    ui.label(
+                        RichText::new(if dirty {
+                            text.editing_unsaved
+                        } else {
+                            text.editing
+                        })
+                        .size(11.)
+                        .color(if dirty {
+                            palette.warning
+                        } else {
+                            palette.accent
+                        }),
+                    );
+                    ui.separator();
+                    if let Some((aspect, _)) = crop {
+                        if let Some(value) = aspect_segments(
+                            ui,
+                            &[
+                                (CropAspect::Free, text.aspect_free),
+                                (CropAspect::Square, text.aspect_square),
+                                (CropAspect::FourThree, text.aspect_four_three),
+                                (CropAspect::ThreeTwo, text.aspect_three_two),
+                                (CropAspect::SixteenNine, text.aspect_sixteen_nine),
+                                (CropAspect::Original, text.aspect_original),
+                            ],
+                            aspect,
+                            !blocked,
+                            palette,
+                            text.crop_aspect_tooltip,
+                        ) {
+                            self.set_crop_aspect(value);
+                        }
+                        if action_button(
+                            ui,
+                            text.crop_apply,
+                            !blocked,
+                            true,
+                            palette,
+                            text.crop_apply_tooltip,
+                        ) {
+                            self.perform(Action::CropApply, viewport, ui.ctx());
+                        }
+                        if action_button(
+                            ui,
+                            text.crop_cancel,
+                            !blocked,
+                            false,
+                            palette,
+                            text.crop_cancel_tooltip,
+                        ) {
+                            self.perform(Action::CropCancel, viewport, ui.ctx());
+                        }
+                    } else {
+                        if action_button(ui, text.crop, !blocked, false, palette, text.crop_tooltip)
+                        {
+                            self.enter_crop();
+                        }
+                        if action_button(
+                            ui,
+                            text.rotate_left,
+                            !blocked,
+                            false,
+                            palette,
+                            text.edit_rotate_tooltip,
+                        ) {
+                            self.perform(Action::RotateLeft, viewport, ui.ctx());
+                        }
+                        if action_button(
+                            ui,
+                            text.rotate_right,
+                            !blocked,
+                            false,
+                            palette,
+                            text.edit_rotate_tooltip,
+                        ) {
+                            self.perform(Action::RotateRight, viewport, ui.ctx());
+                        }
+                        if action_button(
+                            ui,
+                            text.flip_h,
+                            !blocked,
+                            false,
+                            palette,
+                            text.flip_h_tooltip,
+                        ) {
+                            self.perform(Action::FlipHorizontal, viewport, ui.ctx());
+                        }
+                        if action_button(
+                            ui,
+                            text.flip_v,
+                            !blocked,
+                            false,
+                            palette,
+                            text.flip_v_tooltip,
+                        ) {
+                            self.perform(Action::FlipVertical, viewport, ui.ctx());
+                        }
+                        ui.separator();
+                        if action_button(
+                            ui,
+                            text.undo,
+                            !blocked && dirty,
+                            false,
+                            palette,
+                            text.undo_tooltip,
+                        ) {
+                            self.perform(Action::UndoEdit, viewport, ui.ctx());
+                        }
+                        ui.separator();
+                        if action_button(
+                            ui,
+                            text.save_as,
+                            !blocked,
+                            false,
+                            palette,
+                            text.save_as_tooltip,
+                        ) {
+                            self.perform(Action::SaveAs, viewport, ui.ctx());
+                        }
+                        // A member of an archive has no file to replace; saying so
+                        // here beats failing after the confirmation.
+                        let (save_enabled, save_hint) = if archive {
+                            (false, text.archive_cannot_overwrite)
+                        } else {
+                            (!blocked, text.save_tooltip)
+                        };
+                        if danger_button(ui, text.save, save_enabled, palette, save_hint) {
+                            self.perform(Action::SaveOverwrite, viewport, ui.ctx());
+                        }
+                        if action_button(
+                            ui,
+                            text.edit_exit,
+                            !blocked,
+                            false,
+                            palette,
+                            text.edit_exit_tooltip,
+                        ) {
+                            self.perform(Action::EditExit, viewport, ui.ctx());
+                        }
+                    }
+                });
+                if let Some((_, rect)) = crop {
+                    ui.horizontal(|ui| {
+                        truncated_label(ui, text.crop_hint, 11., palette.muted, 210.);
+                        ui.label(
+                            RichText::new(text.dimensions(rect.w, rect.h))
+                                .size(11.)
+                                .monospace()
+                                .color(palette.text),
+                        );
+                        if viewport.width() > 0. && crop_needs_zoom(zoom_scale) {
+                            ui.label(
+                                RichText::new(text.crop_zoom_hint)
+                                    .size(11.)
+                                    .color(palette.warning),
+                            );
+                        }
+                    });
+                }
+            });
+    }
+
+    fn save_confirm_modal(&mut self, ctx: &egui::Context, palette: Palette) {
+        let Some(confirm) = self.edit_ui.as_ref().and_then(|edit| edit.confirm.as_ref()) else {
+            return;
+        };
+        let path = confirm.path.clone();
+        let format = confirm.format;
+        let overwrite = confirm.overwrite;
+        let Some(edit) = self.edit_ui.as_ref() else {
+            return;
+        };
+        let preview = Arc::clone(edit.session.preview());
+        let mut quality = edit.quality;
+        let transparent =
+            format == export::ExportFormat::Jpeg && export::has_transparency(&preview);
+        let text = self.text();
+        // Closing blocks new writes; show that here instead of failing after the
+        // fact.
+        let blocked = self.close_state.requested;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let warnings = save_warning_rows(text, format, overwrite, transparent);
+        let mut confirm_clicked = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::unique("save-confirm"))
+            .frame(
+                EguiFrame::new()
+                    .fill(palette.surface)
+                    .stroke(Stroke::new(1., palette.border))
+                    .corner_radius(10.)
+                    .inner_margin(Margin::symmetric(18, 16)),
+            )
+            .show(ctx, |ui| {
+                // egui can turn Enter into a click on the focused button; strip
+                // every pressed Enter before any widget is built. The buttons
+                // below are the only way to confirm.
+                ui.input_mut(|input| {
+                    input
+                        .events
+                        .retain(|event| !save_confirm_strips_event(event));
+                });
+                ui.set_width(460.);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(text.save_confirm_heading(&name, overwrite))
+                            .size(17.)
+                            .strong()
+                            .color(palette.text),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(2.);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(path.display().to_string())
+                            .size(11.)
+                            .monospace()
+                            .color(palette.muted),
+                    )
+                    .wrap(),
+                );
+                ui.label(
+                    RichText::new(text.save_confirm_format(format_label(format)))
+                        .size(11.)
+                        .color(palette.muted),
+                );
+                if !warnings.is_empty() {
+                    ui.add_space(8.);
+                    EguiFrame::new()
+                        .fill(palette.warning_bg)
+                        .stroke(Stroke::new(1., palette.warning))
+                        .corner_radius(6.)
+                        .inner_margin(Margin::symmetric(10, 7))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            for row in warnings {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("•  {row}"))
+                                            .size(11.5)
+                                            .color(palette.warning),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                        });
+                }
+                if format == export::ExportFormat::Jpeg {
+                    ui.add_space(8.);
+                    ui.add(
+                        egui::Slider::new(
+                            &mut quality,
+                            export::JPEG_QUALITY_MIN..=export::JPEG_QUALITY_MAX,
+                        )
+                        .text(text.save_confirm_quality)
+                        .max_decimals(0),
+                    );
+                }
+                ui.add_space(6.);
+                ui.label(
+                    RichText::new(text.save_confirm_atomic)
+                        .size(11.)
+                        .color(palette.muted),
+                );
+                ui.add_space(10.);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let (label, hint) = if overwrite {
+                            (text.save_confirm_replace, text.save_confirm_replace_tooltip)
+                        } else {
+                            (text.save, text.save_as_tooltip)
+                        };
+                        if danger_button(ui, label, !blocked, palette, hint) {
+                            confirm_clicked = true;
+                        }
+                        if action_button(ui, text.cancel, true, false, palette, text.cancel_tooltip)
+                        {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+        if let Some(edit) = self.edit_ui.as_mut() {
+            edit.quality = quality;
+        }
+        if confirm_clicked {
+            if let Some(edit) = self.edit_ui.as_mut() {
+                edit.confirm = None;
+            }
+            self.start_save(path, format, overwrite, ctx);
+        } else if (cancel || modal.should_close())
+            && let Some(edit) = self.edit_ui.as_mut()
+        {
+            edit.confirm = None;
+        }
+    }
+
+    fn resolve_pending_edit(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.edit_pending.as_ref() else {
+            return;
+        };
+        if self.loading_file || self.busy() {
+            return;
+        }
+        let media_matches = self
+            .media
+            .as_ref()
+            .is_some_and(|media| media.source == pending.source);
+        let source_ready = media_matches
+            && self.selected.as_ref() == Some(&pending.source)
+            && self.displayed.as_ref() == Some(&pending.source)
+            && self.display_mode == ReadingMode::Single
+            && self.other_pages.is_empty()
+            && self.media.as_ref().is_some_and(|media| {
+                media.frames.len() == 1 && media.loop_mode == model::LoopMode::Once
+            })
+            && editable_format(&pending.source).is_some();
+        if !source_ready {
+            self.cancel_pending_edit(ctx);
+            return;
+        }
+        let pending = self.edit_pending.take().expect("checked above");
+        self.begin_edit(
+            ctx,
+            pending.rotation,
+            Some(pending.restore),
+            pending.source,
+            pending.crop,
+        );
+    }
+
     fn canvas(&mut self, ui: &mut egui::Ui, palette: Palette) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let viewport = response.rect;
@@ -3906,7 +5803,10 @@ impl Oxeye {
         if self.settings_draft.is_none() {
             self.handle_keys(viewport, ui.ctx());
             self.handle_wheel(&response, viewport, ui.ctx());
-            if response.dragged_by(PointerButton::Primary) && self.tiled.is_some() {
+            if response.dragged_by(PointerButton::Primary)
+                && self.tiled.is_some()
+                && !self.crop_active()
+            {
                 let delta = response.drag_delta();
                 self.pan[0] += delta.x;
                 self.pan[1] += delta.y;
@@ -3957,6 +5857,9 @@ impl Oxeye {
             }
         }
         self.textures.retain(&painted);
+        if self.crop_active() {
+            self.crop_layer(ui.ctx(), &response, &painter, viewport, palette);
+        }
         self.draw_badge(&painter, viewport, palette);
     }
 
@@ -4073,29 +5976,65 @@ impl Oxeye {
         }
     }
 
+    /// Temporary state over the canvas: a small translucent pill in the top-left
+    /// corner, away from the image centre and light enough to read the pixels
+    /// underneath.
     fn draw_badge(&self, painter: &egui::Painter, viewport: Rect, palette: Palette) {
-        if self.tiled.is_none() {
+        // While cropping the pill would sit on top of the corner handles, and the
+        // crop frame already says the app is in edit mode.
+        if self.tiled.is_none() || self.crop_active() {
             return;
         }
         let rotating = self.rotation.requested != self.rotation.displayed;
         let text = self.text();
-        let message = if self.loading_file {
-            self.selected
+        let editing = self.edit_ui.as_ref().map(|edit| {
+            if edit.session.dirty() {
+                (text.editing_unsaved, palette.warning)
+            } else {
+                (text.editing, palette.accent)
+            }
+        });
+        let (message, dot) = if self.loading_file {
+            let message = self
+                .selected
                 .as_ref()
                 .map(|source| text.opening_file(&source_label(source)))
-                .unwrap_or_else(|| text.opening_image.to_owned())
+                .unwrap_or_else(|| text.opening_image.to_owned());
+            (message, palette.muted)
+        } else if let Some((editing, dot)) = editing {
+            (editing.to_owned(), dot)
         } else if rotating {
-            text.rotating.to_owned()
+            (text.rotating.to_owned(), palette.muted)
         } else {
             return;
         };
-        let galley = painter.layout_no_wrap(message, FontId::proportional(12.), palette.muted);
+        let galley = painter.layout_no_wrap(message, FontId::proportional(11.5), palette.text);
+        let padding = egui::vec2(9., 5.);
+        let dot_space = 12.;
         let background = Rect::from_min_size(
             viewport.min + egui::vec2(12., 12.),
-            galley.size() + egui::vec2(20., 12.),
+            galley.size() + egui::vec2(padding.x * 2. + dot_space, padding.y * 2.),
         );
-        painter.rect_filled(background, 6., palette.surface);
-        painter.galley(background.min + egui::vec2(10., 6.), galley, palette.muted);
+        painter.rect_filled(background, 5., translucent(palette.surface, 228));
+        painter.rect_stroke(
+            background,
+            5.,
+            Stroke::new(1., translucent(palette.border, 200)),
+            egui::StrokeKind::Inside,
+        );
+        painter.circle_filled(
+            Pos2::new(background.left() + padding.x + 3., background.center().y),
+            3.,
+            dot,
+        );
+        painter.galley(
+            Pos2::new(
+                background.left() + padding.x + dot_space,
+                background.top() + padding.y,
+            ),
+            galley,
+            palette.text,
+        );
     }
 }
 
@@ -4128,7 +6067,7 @@ impl eframe::App for Oxeye {
         if let Some(path) = self.initial.take() {
             self.open_path(path, ctx);
         }
-        if self.settings_draft.is_none() {
+        if self.settings_draft.is_none() && !self.editing() {
             let dropped = ctx.input(|input| {
                 input
                     .raw
@@ -4142,6 +6081,8 @@ impl eframe::App for Oxeye {
         }
         self.poll_workers(ctx);
         self.advance_frames(ctx);
+        self.resolve_pending_edit(ctx);
+        self.poll_save(ctx);
         self.fill_cached_dimensions();
         self.tick(ctx);
         self.sync_prefetch(ctx);
@@ -4155,12 +6096,14 @@ impl eframe::App for Oxeye {
         if self.error.is_some() {
             self.error_banner(ui, palette);
         }
+        self.edit_toolbar(ui, palette);
         self.footer(ui, palette);
         self.preview_strip(ui, palette);
         egui::CentralPanel::no_frame()
             .frame(EguiFrame::new().fill(palette.canvas))
             .show(ui, |ui| self.canvas(ui, palette));
         self.settings_modal(ui.ctx(), palette);
+        self.save_confirm_modal(ui.ctx(), palette);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -4223,6 +6166,7 @@ mod tests {
             mode,
             spread,
             Language::English,
+            0,
         )
     }
 
@@ -5726,7 +7670,8 @@ mod tests {
     #[test]
     fn command_shortcuts_do_not_fire_for_plain_letters() {
         assert_eq!(key_action(Key::C, Modifiers::COMMAND), Some(Action::Copy));
-        assert_eq!(key_action(Key::C, Modifiers::NONE), None);
+        // Plain C is the edit entry point since 0.3.0.
+        assert_eq!(key_action(Key::C, Modifiers::NONE), Some(Action::Edit));
         assert_eq!(
             key_action(Key::C, Modifiers::COMMAND | Modifiers::ALT),
             None
@@ -5811,7 +7756,7 @@ mod tests {
         assert!(!loader.finish(first));
         let (latest, work, _) = loader.take().unwrap();
         assert!(
-            matches!(work, Work::Load(path, _, _, _, _, _, _) if path == SourceRef::file(Path::new("third.png")))
+            matches!(work, Work::Load(path, _, _, _, _, _, _, _) if path == SourceRef::file(Path::new("third.png")))
         );
         assert!(loader.finish(latest));
         assert!(loader.take().is_none());
@@ -5859,6 +7804,7 @@ mod tests {
                 ReadingMode::Single,
                 vec![index],
                 Language::English,
+                0,
             ));
             let (revision, work, cancelled) = loader.take().unwrap();
             let result = prepare(work, &cancelled);
@@ -6281,6 +8227,43 @@ mod tests {
             }],
             loop_mode: model::LoopMode::Once,
         })
+    }
+
+    fn install_fixture(app: &mut Oxeye, turns: u8) -> Arc<RgbaImage> {
+        let pixels = Arc::new(RgbaImage::from_fn(4, 3, |x, y| {
+            image::Rgba([(y * 4 + x) as u8, 0, 0, 255])
+        }));
+        let media = media(Arc::clone(&pixels));
+        let source = media.source.clone();
+        let tiled = Arc::new(prepare_tiles(&pixels, MAX_TILE, &AtomicBool::new(false)).unwrap());
+        app.media = Some(media);
+        app.tiled = Some(tiled);
+        app.selected = Some(source.clone());
+        app.displayed = Some(source.clone());
+        app.current_file = Some(source.clone());
+        app.siblings = vec![source];
+        app.dimensions = (4, 3);
+        app.rotation.commit(turns);
+        pixels
+    }
+
+    fn editing_fixture() -> Oxeye {
+        let mut app = test_app();
+        install_fixture(&mut app, 0);
+        let rotation = app.rotation;
+        let source = app.media.as_ref().unwrap().source.clone();
+        app.begin_edit(&egui::Context::default(), rotation, None, source, false);
+        app
+    }
+
+    fn pending_book_fixture(crop: bool) -> Oxeye {
+        let mut app = test_app();
+        install_fixture(&mut app, 1);
+        app.settings.reading_mode = ReadingMode::Book;
+        app.display_mode = ReadingMode::Book;
+        app.rotation.commit(1);
+        app.request_edit(crop, &egui::Context::default());
+        app
     }
 
     fn animated_media(
@@ -6946,5 +8929,1052 @@ mod tests {
         assert_eq!(spread.targets(ms(150)), [0, 1]);
         assert!(spread_any_playing(&Some(spread), ms(150)));
         assert!(!SpreadPlayback::new([None, None], Duration::ZERO).any_playing(Duration::ZERO));
+    }
+
+    #[test]
+    fn edit_shortcuts_distinguish_command_shift_and_keep_legacy_keys() {
+        assert_eq!(key_action(Key::C, Modifiers::NONE), Some(Action::Edit));
+        assert_eq!(
+            key_action(Key::X, Modifiers::NONE),
+            Some(Action::FlipHorizontal)
+        );
+        assert_eq!(
+            key_action(Key::Y, Modifiers::NONE),
+            Some(Action::FlipVertical)
+        );
+        assert_eq!(
+            key_action(Key::Enter, Modifiers::NONE),
+            Some(Action::CropApply)
+        );
+        assert_eq!(
+            key_action(Key::Escape, Modifiers::NONE),
+            Some(Action::Escape)
+        );
+        assert_eq!(
+            key_action(Key::S, Modifiers::COMMAND),
+            Some(Action::SaveOverwrite)
+        );
+        let command_shift = Modifiers {
+            command: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(key_action(Key::S, command_shift), Some(Action::SaveAs));
+        assert_eq!(
+            key_action(Key::Z, Modifiers::COMMAND),
+            Some(Action::UndoEdit)
+        );
+        assert_eq!(key_action(Key::S, Modifiers::NONE), None);
+        // Existing shortcuts keep their meaning.
+        assert_eq!(key_action(Key::C, Modifiers::COMMAND), Some(Action::Copy));
+        assert_eq!(
+            key_action(Key::W, Modifiers::NONE),
+            Some(Action::WideToggle)
+        );
+        assert_eq!(
+            key_action(Key::M, Modifiers::NONE),
+            Some(Action::ToggleMode)
+        );
+        assert_eq!(key_action(Key::P, Modifiers::NONE), Some(Action::Playback));
+        assert_eq!(
+            key_action(Key::Enter, Modifiers::ALT),
+            Some(Action::Fullscreen)
+        );
+        for action in [
+            Action::Edit,
+            Action::UndoEdit,
+            Action::FlipHorizontal,
+            Action::FlipVertical,
+            Action::SaveOverwrite,
+            Action::SaveAs,
+            Action::CropApply,
+            Action::CropCancel,
+            Action::EditExit,
+        ] {
+            assert!(!action_allows_repeat(action), "{action:?} must not repeat");
+        }
+    }
+
+    #[test]
+    fn editing_bakes_display_rotation_and_exit_restores_the_original_view() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        install_fixture(&mut app, 1);
+        let original = app.media.clone().unwrap();
+        let rotation = app.rotation;
+        let source = app.media.as_ref().unwrap().source.clone();
+        app.begin_edit(&ctx, rotation, None, source, false);
+        assert!(app.editing());
+        assert_eq!(app.rotation.displayed, 0);
+        assert_eq!(app.rotation.requested, 0);
+        assert_eq!(app.dimensions, (3, 4));
+        assert_eq!(app.edit_ui.as_ref().unwrap().original_rotation.displayed, 1);
+
+        app.perform(Action::RotateLeft, Rect::NOTHING, &ctx);
+        assert!(app.edit_ui.as_ref().unwrap().session.dirty());
+        assert_eq!(app.dimensions, (4, 3));
+        app.perform(Action::FlipHorizontal, Rect::NOTHING, &ctx);
+        assert_eq!(app.dimensions, (4, 3));
+
+        app.perform(Action::UndoEdit, Rect::NOTHING, &ctx);
+        assert_eq!(app.dimensions, (4, 3));
+        assert!(app.edit_ui.as_ref().unwrap().session.dirty());
+        app.perform(Action::UndoEdit, Rect::NOTHING, &ctx);
+        assert_eq!(app.dimensions, (3, 4));
+        assert!(!app.edit_ui.as_ref().unwrap().session.dirty());
+        assert_eq!(app.rotation.displayed, 0);
+
+        app.perform(Action::EditExit, Rect::NOTHING, &ctx);
+        assert!(!app.editing());
+        assert_eq!(app.rotation.displayed, 1);
+        assert_eq!(app.rotation.requested, 1);
+        assert_eq!(app.dimensions, (4, 3));
+        assert!(Arc::ptr_eq(app.media.as_ref().unwrap(), &original));
+    }
+
+    #[test]
+    fn book_edit_remembers_and_restores_book_mode() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        install_fixture(&mut app, 0);
+        app.settings.reading_mode = ReadingMode::Book;
+        app.display_mode = ReadingMode::Book;
+        let rotation = app.rotation;
+        let source = app.media.as_ref().unwrap().source.clone();
+        app.begin_edit(&ctx, rotation, Some(ReadingMode::Book), source, false);
+        assert_eq!(
+            app.edit_ui.as_ref().unwrap().restore_mode,
+            Some(ReadingMode::Book)
+        );
+        app.perform(Action::EditExit, Rect::NOTHING, &ctx);
+        assert!(!app.editing());
+        assert_eq!(app.settings.reading_mode, ReadingMode::Book);
+        app.loader.cancel();
+    }
+
+    #[test]
+    fn edit_rejects_read_only_formats_animated_media_and_archive_overwrite() {
+        use crate::model::source::ArchiveKind;
+        let ctx = egui::Context::default();
+        for name in ["photo.gif", "scan.tiff", "icon.ico"] {
+            let mut app = test_app();
+            install_fixture(&mut app, 0);
+            let source = SourceRef::file(Path::new(name));
+            app.media = Some(Arc::new(model::LoadedMedia {
+                source: source.clone(),
+                frames: vec![model::MediaFrame {
+                    pixels: Arc::new(RgbaImage::new(4, 3)),
+                    delay: Duration::ZERO,
+                }],
+                loop_mode: model::LoopMode::Once,
+            }));
+            app.selected = Some(source.clone());
+            app.displayed = Some(source.clone());
+            app.current_file = Some(source);
+            app.request_edit(false, &ctx);
+            assert!(!app.editing(), "{name} must stay read-only");
+            assert!(
+                app.feedback
+                    .notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.text.contains("PNG")),
+                "{name} should explain the writable formats"
+            );
+        }
+
+        let mut app = test_app();
+        install_fixture(&mut app, 0);
+        let pixels = Arc::new(RgbaImage::new(2, 2));
+        let animated = Arc::new(model::LoadedMedia {
+            source: SourceRef::file(Path::new("still.png")),
+            frames: (0..2)
+                .map(|_| model::MediaFrame {
+                    pixels: Arc::clone(&pixels),
+                    delay: Duration::ZERO,
+                })
+                .collect(),
+            loop_mode: model::LoopMode::Once,
+        });
+        app.selected = Some(animated.source.clone());
+        app.displayed = Some(animated.source.clone());
+        app.current_file = Some(animated.source.clone());
+        app.media = Some(animated);
+        app.request_edit(false, &ctx);
+        assert!(!app.editing());
+        assert_eq!(
+            app.feedback
+                .notice
+                .as_ref()
+                .map(|notice| notice.text.as_str()),
+            Some(app.text().edit_single_frame)
+        );
+
+        let mut app = editing_fixture();
+        let archive = SourceRef::Archive {
+            archive: PathBuf::from("book.cbz"),
+            archive_len: 1,
+            archive_mtime_secs: 0,
+            archive_mtime_nanos: 0,
+            kind: ArchiveKind::Zip,
+            index: 0,
+            name: "page.png".into(),
+            size: 0,
+            crc: 0,
+        };
+        app.selected = Some(archive.clone());
+        app.edit_ui.as_mut().unwrap().source = archive.clone();
+        app.request_save_overwrite(&ctx);
+        assert!(app.edit_ui.as_ref().unwrap().confirm.is_none());
+        assert_eq!(
+            app.feedback
+                .notice
+                .as_ref()
+                .map(|notice| notice.text.as_str()),
+            Some(app.text().archive_cannot_overwrite)
+        );
+        assert_eq!(editable_format(&archive), Some(export::ExportFormat::Png));
+        let mut gif = archive;
+        match &mut gif {
+            SourceRef::Archive { name, .. } => *name = "page.gif".into(),
+            SourceRef::File(_) => unreachable!(),
+        }
+        assert_eq!(editable_format(&gif), None);
+        assert_eq!(
+            editable_format(&SourceRef::file(Path::new("scan.tiff"))),
+            None
+        );
+    }
+
+    #[test]
+    fn crop_enter_applies_and_escape_cancels_without_touching_the_session() {
+        let ctx = egui::Context::default();
+        let mut app = editing_fixture();
+        app.perform(Action::CropApply, Rect::NOTHING, &ctx);
+        assert!(!app.crop_active());
+        assert!(!app.edit_ui.as_ref().unwrap().session.dirty());
+
+        app.enter_crop();
+        assert!(app.crop_active());
+        if let Some(crop) = app.edit_ui.as_mut().and_then(|edit| edit.crop.as_mut()) {
+            crop.rect = edit::PixelRect {
+                x: 1,
+                y: 0,
+                w: 2,
+                h: 2,
+            };
+        }
+        app.perform(Action::CropApply, Rect::NOTHING, &ctx);
+        assert!(!app.crop_active());
+        assert_eq!(app.dimensions, (2, 2));
+        assert!(app.edit_ui.as_ref().unwrap().session.dirty());
+
+        app.enter_crop();
+        assert!(app.crop_active());
+        // Esc leaves crop mode but keeps the applied edit.
+        app.perform(Action::Escape, Rect::NOTHING, &ctx);
+        assert!(!app.crop_active());
+        assert!(app.editing());
+        assert_eq!(app.dimensions, (2, 2));
+        assert!(app.edit_ui.as_ref().unwrap().session.dirty());
+
+        app.perform(Action::Escape, Rect::NOTHING, &ctx);
+        assert!(!app.editing());
+        assert_eq!(app.dimensions, (4, 3));
+    }
+
+    #[test]
+    fn editing_swallows_navigation_mode_and_preview_shortcuts() {
+        let ctx = egui::Context::default();
+        let mut app = editing_fixture();
+        app.siblings.push(SourceRef::file(Path::new("next.png")));
+        let source = app.selected.clone().unwrap();
+        for action in [
+            Action::Next,
+            Action::Previous,
+            Action::First,
+            Action::Last,
+            Action::JumpFiles(1),
+            Action::Pan {
+                vertical: false,
+                forward: true,
+            },
+            Action::ToggleMode,
+            Action::WideToggle,
+            Action::Playback,
+        ] {
+            app.perform(action, Rect::NOTHING, &ctx);
+        }
+        assert_eq!(app.selected.as_ref(), Some(&source));
+        assert!(app.navigation.is_idle());
+        assert_eq!(app.settings.reading_mode, ReadingMode::Single);
+        let visible = app.settings.thumbnails_visible;
+        app.toggle_previews(&ctx);
+        assert_eq!(app.settings.thumbnails_visible, visible);
+    }
+
+    #[test]
+    fn book_request_edit_defers_entry_until_the_single_frame_commits() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        install_fixture(&mut app, 0);
+        app.settings.reading_mode = ReadingMode::Book;
+        app.display_mode = ReadingMode::Book;
+        app.request_edit(true, &ctx);
+        assert!(!app.editing());
+        assert!(app.edit_pending.is_some());
+        let pending = app.edit_pending.as_ref().unwrap();
+        assert_eq!(pending.restore, ReadingMode::Book);
+        assert!(pending.crop);
+        assert_eq!(pending.source, app.media.as_ref().unwrap().source);
+        assert_eq!(app.settings.reading_mode, ReadingMode::Single);
+        app.edit_pending = None;
+        app.loader.cancel();
+    }
+
+    #[test]
+    fn overwrite_confirmation_targets_the_original_and_escape_cancels_it() {
+        let ctx = egui::Context::default();
+        let mut app = editing_fixture();
+        app.request_save_overwrite(&ctx);
+        let confirm = app
+            .edit_ui
+            .as_ref()
+            .unwrap()
+            .confirm
+            .as_ref()
+            .expect("overwrite asks for confirmation");
+        assert_eq!(confirm.format, export::ExportFormat::Png);
+        assert!(confirm.path.ends_with("fixture.png"));
+        assert!(confirm.overwrite);
+        app.perform(Action::Escape, Rect::NOTHING, &ctx);
+        assert!(app.edit_ui.as_ref().unwrap().confirm.is_none());
+        assert!(app.editing());
+    }
+
+    #[test]
+    fn edit_rejects_when_the_selection_no_longer_matches_the_media() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        install_fixture(&mut app, 0);
+        let failed = SourceRef::file(Path::new("failed-target.png"));
+        app.selected = Some(failed.clone());
+        app.request_edit(false, &ctx);
+        assert!(!app.editing());
+        assert_eq!(
+            app.feedback
+                .notice
+                .as_ref()
+                .map(|notice| notice.text.as_str()),
+            Some(app.text().edit_source_mismatch)
+        );
+        // The frozen edit source is used for saves, not `selected`.
+        let mut app = editing_fixture();
+        let frozen = app.edit_ui.as_ref().unwrap().source.clone();
+        app.selected = Some(failed);
+        app.request_save_overwrite(&ctx);
+        let confirm = app
+            .edit_ui
+            .as_ref()
+            .unwrap()
+            .confirm
+            .as_ref()
+            .expect("overwrite still targets the frozen source");
+        assert_eq!(confirm.path.as_path(), frozen.path());
+        assert!(confirm.overwrite);
+    }
+
+    #[test]
+    fn save_confirm_strips_enter_for_every_modifier_combination() {
+        for modifiers in [
+            Modifiers::NONE,
+            Modifiers::SHIFT,
+            Modifiers::COMMAND,
+            Modifiers::ALT,
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            Modifiers::COMMAND | Modifiers::ALT,
+        ] {
+            let enter = egui::Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            };
+            assert!(save_confirm_strips_event(&enter), "{modifiers:?}");
+        }
+        for event in [
+            egui::Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+            egui::Event::Key {
+                key: Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+            egui::Event::Text("\n".into()),
+        ] {
+            assert!(!save_confirm_strips_event(&event), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn crop_handles_scale_with_dpi_and_stay_grabbable() {
+        assert_eq!(crop_handle_size(1.), 8.);
+        assert_eq!(crop_handle_size(0.5), 8.);
+        assert!((crop_handle_size(2.) - 9.5).abs() < 1e-4);
+        assert_eq!(crop_handle_size(4.), 12.);
+        assert!(crop_handle_size(2.) > crop_handle_size(1.));
+
+        // The same point that is outside a 1x hit radius is inside a 2x one.
+        let screen = [100., 100., 200., 100.];
+        let edge = Pos2::new(100. + 200. + 7., 100. + 50.);
+        assert_eq!(
+            crop_handle_at(screen, edge, crop_handle_size(1.)),
+            Some(CropHandle::East)
+        );
+        assert_eq!(crop_handle_at(screen, edge, 1.), None);
+    }
+
+    #[test]
+    fn crop_handle_points_push_outward_only_for_tiny_rects() {
+        let screen = [100., 200., 300., 200.];
+        let points = crop_handle_points(screen, 9.);
+        let center_of = |handle: CropHandle| {
+            points
+                .iter()
+                .find(|(candidate, _)| *candidate == handle)
+                .map(|(_, pos)| *pos)
+                .unwrap()
+        };
+        assert_eq!(center_of(CropHandle::NorthWest), Pos2::new(100., 200.));
+        assert_eq!(center_of(CropHandle::SouthEast), Pos2::new(400., 400.));
+        assert_eq!(center_of(CropHandle::North), Pos2::new(250., 200.));
+        assert_eq!(center_of(CropHandle::West), Pos2::new(100., 300.));
+
+        // A 1x1 crop at high zoom is a single point on screen; the corner and
+        // edge handles must leave the rect, or all eight overlap.
+        let tiny = crop_handle_points([100., 100., 0., 0.], 9.);
+        for (handle, pos) in tiny {
+            assert!(
+                pos != Pos2::new(100., 100.),
+                "{handle:?} is still stacked on the rect"
+            );
+            if matches!(handle, CropHandle::NorthWest | CropHandle::SouthEast) {
+                assert!(
+                    pos.x <= 100. - 9. + 1e-4 || pos.x >= 100. + 9. - 1e-4,
+                    "{handle:?} {pos:?}"
+                );
+            }
+        }
+        let tiny_center_of = |handle: CropHandle| {
+            tiny.iter()
+                .find(|(candidate, _)| *candidate == handle)
+                .map(|(_, pos)| *pos)
+                .unwrap()
+        };
+        assert_eq!(tiny_center_of(CropHandle::NorthWest), Pos2::new(91., 91.));
+        assert_eq!(tiny_center_of(CropHandle::SouthEast), Pos2::new(109., 109.));
+    }
+
+    #[test]
+    fn tiny_rect_handles_hit_their_own_centres() {
+        use CropHandle::*;
+        // A sub-pixel rect on screen: every handle is pushed out by `size`, so
+        // neighbouring hit boxes overlap heavily.
+        let screen = [100., 100., 0.1, 0.1];
+        let size = 8.;
+        let points = crop_handle_points(screen, size);
+        for (handle, center) in points {
+            assert_eq!(
+                crop_handle_at(screen, center, size),
+                Some(handle),
+                "{handle:?} centre must hit itself, not a neighbour"
+            );
+        }
+        // Off-centre clicks inside an overlap still resolve to the nearest one.
+        let north = points
+            .iter()
+            .find(|(handle, _)| *handle == North)
+            .unwrap()
+            .1;
+        let closer_to_north = Pos2::new(north.x - 1., north.y);
+        assert_eq!(crop_handle_at(screen, closer_to_north, size), Some(North));
+    }
+
+    #[test]
+    fn resize_uses_the_pointer_delta_so_outward_handles_do_not_jump() {
+        use CropHandle::*;
+        let origin = edit::PixelRect {
+            x: 10,
+            y: 10,
+            w: 2,
+            h: 2,
+        };
+        for handle in [
+            NorthWest, North, NorthEast, East, SouthEast, South, SouthWest, West,
+        ] {
+            assert_eq!(
+                resize_crop(origin, handle, [0., 0.], (100, 100)),
+                origin,
+                "{handle:?} must not move before the pointer does"
+            );
+        }
+        // The East handle of this 2px rect is drawn 8pt out, so the press point is
+        // at ~20.5px, not at the 12px edge. One pixel of drag must add one pixel.
+        let anchor = [20.5, 11.];
+        let point = [21.5, 11.];
+        let dragged = resize_crop(
+            origin,
+            East,
+            [point[0] - anchor[0], point[1] - anchor[1]],
+            (100, 100),
+        );
+        assert_eq!(dragged.w, 3, "the outward offset is not a boundary");
+        assert_eq!(dragged, edit::PixelRect { w: 3, ..origin });
+
+        // Edges stay in the image and the one-pixel minimum is preserved.
+        assert_eq!(
+            resize_crop(origin, NorthWest, [-50., -50.], (100, 100)),
+            edit::PixelRect {
+                x: 0,
+                y: 0,
+                w: 12,
+                h: 12
+            }
+        );
+        assert_eq!(
+            resize_crop(origin, East, [-50., 0.], (100, 100)),
+            edit::PixelRect {
+                x: 0,
+                y: 10,
+                w: 1,
+                h: 2
+            }
+        );
+    }
+
+    #[test]
+    fn crop_hover_maps_every_handle_to_a_resize_cursor() {
+        use CropHandle::*;
+        for (handle, icon) in [
+            (NorthWest, CursorIcon::ResizeNwSe),
+            (SouthEast, CursorIcon::ResizeNwSe),
+            (NorthEast, CursorIcon::ResizeNeSw),
+            (SouthWest, CursorIcon::ResizeNeSw),
+            (North, CursorIcon::ResizeVertical),
+            (South, CursorIcon::ResizeVertical),
+            (East, CursorIcon::ResizeHorizontal),
+            (West, CursorIcon::ResizeHorizontal),
+        ] {
+            assert_eq!(crop_cursor(handle), icon, "{handle:?}");
+        }
+    }
+
+    #[test]
+    fn crop_zoom_hint_only_appears_below_half_a_point_per_pixel() {
+        assert!(crop_needs_zoom(0.2));
+        assert!(!crop_needs_zoom(0.5));
+        assert!(!crop_needs_zoom(1.));
+    }
+
+    #[test]
+    fn indeterminate_progress_span_stays_inside_its_track() {
+        for width in [80.0_f32, 460.] {
+            let thumb = (width * 0.3).min(120.);
+            for step in 0..10 {
+                let (start, end) = indeterminate_span(step as f32 / 10., width);
+                assert!(start >= 0. && end <= width + 1e-4, "{start}..{end}");
+                assert!((end - start - thumb).abs() < 1e-4);
+            }
+            let (start, end) = indeterminate_span(0., width);
+            assert!(
+                start.abs() < 1e-4 && (end - thumb).abs() < 1e-4,
+                "enters left"
+            );
+        }
+        // Clamped phases never leave the track.
+        let clamped = indeterminate_span(-1., 100.);
+        assert!(clamped.0.abs() < 1e-4 && (clamped.1 - 30.).abs() < 1e-4);
+        let clamped = indeterminate_span(2., 100.);
+        assert!((clamped.0 - 70.).abs() < 1e-4 && (clamped.1 - 100.).abs() < 1e-4);
+    }
+
+    #[test]
+    fn save_warnings_cover_metadata_undo_and_format_risks() {
+        for catalog in [&ui_text::EN, &ui_text::ZH, &ui_text::JA] {
+            let overwrite = save_warning_rows(catalog, export::ExportFormat::Jpeg, true, true);
+            assert_eq!(overwrite.len(), 3);
+            assert_eq!(overwrite[0], catalog.save_confirm_warning);
+            assert_eq!(overwrite[1], catalog.save_confirm_irreversible);
+            assert_eq!(overwrite[2], catalog.save_confirm_transparency);
+
+            let copy = save_warning_rows(catalog, export::ExportFormat::Webp, false, true);
+            assert_eq!(copy, vec![catalog.save_confirm_webp]);
+
+            assert!(
+                save_warning_rows(catalog, export::ExportFormat::Png, false, true).is_empty(),
+                "a plain copy has no overwrite or format-specific warning to show"
+            );
+        }
+        assert_ne!(
+            save_warning_rows(&ui_text::EN, export::ExportFormat::Png, true, false),
+            save_warning_rows(&ui_text::ZH, export::ExportFormat::Png, true, false)
+        );
+    }
+
+    #[test]
+    fn cancelling_a_pending_edit_restores_the_view_and_ignores_stale_work() {
+        let ctx = egui::Context::default();
+        let mut app = pending_book_fixture(false);
+        let revision = app.loader.revision;
+        let selected = app.selected.clone();
+        let displayed = app.displayed.clone();
+        app.cancel_pending_edit(&ctx);
+        assert!(app.edit_pending.is_none());
+        assert!(!app.loading_file);
+        assert!(app.candidate.is_none());
+        assert_eq!(app.settings.reading_mode, ReadingMode::Book);
+        assert_eq!(app.display_mode, ReadingMode::Book);
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.displayed, displayed);
+        assert_eq!(app.rotation.displayed, 1);
+        assert!(
+            !app.loader.finish(revision),
+            "a stale completion must not commit"
+        );
+        // The same page can request editing again.
+        app.request_edit(false, &ctx);
+        assert!(app.edit_pending.is_some());
+        app.cancel_pending_edit(&ctx);
+    }
+
+    #[test]
+    fn pending_edit_is_cancelled_when_the_source_changes_before_commit() {
+        let ctx = egui::Context::default();
+        let mut app = pending_book_fixture(false);
+        app.loader.cancel();
+        app.loader.running = false;
+        app.candidate = None;
+        app.loading_file = false;
+        let pixels = Arc::new(RgbaImage::new(2, 2));
+        app.media = Some(Arc::new(model::LoadedMedia {
+            source: SourceRef::file(Path::new("other.png")),
+            frames: vec![model::MediaFrame {
+                pixels,
+                delay: Duration::ZERO,
+            }],
+            loop_mode: model::LoopMode::Once,
+        }));
+        app.resolve_pending_edit(&ctx);
+        assert!(app.edit_pending.is_none());
+        assert!(!app.editing());
+        assert_eq!(app.settings.reading_mode, ReadingMode::Book);
+    }
+
+    #[test]
+    fn opening_another_file_cancels_the_pending_edit_and_restores_the_mode() {
+        let ctx = egui::Context::default();
+        let mut app = pending_book_fixture(false);
+        app.open_path(PathBuf::from("notes.txt"), &ctx);
+        assert!(app.edit_pending.is_none());
+        assert!(!app.editing());
+        assert_eq!(app.settings.reading_mode, ReadingMode::Book);
+        assert!(!app.loading_file);
+    }
+
+    #[test]
+    fn save_as_risks_are_decided_before_starting_a_worker() {
+        let text = &ui_text::EN;
+        assert_eq!(
+            save_risk_reason(text, export::ExportFormat::Webp, false),
+            Some(text.save_confirm_webp)
+        );
+        assert_eq!(
+            save_risk_reason(text, export::ExportFormat::Jpeg, true),
+            Some(text.save_confirm_transparency)
+        );
+        assert_eq!(
+            save_risk_reason(text, export::ExportFormat::Jpeg, false),
+            None
+        );
+        assert_eq!(
+            save_risk_reason(text, export::ExportFormat::Png, true),
+            None
+        );
+    }
+
+    #[test]
+    fn close_waits_for_a_running_image_save() {
+        let ctx = egui::Context::default();
+        let mut app = editing_fixture();
+        let (sender, receiver) = mpsc::channel();
+        app.edit_ui.as_mut().unwrap().saving = Some(SaveJob {
+            receiver,
+            overwrite: false,
+            path: PathBuf::from("copy.png"),
+        });
+        app.request_close(&ctx);
+        assert!(app.close_after_save);
+        assert!(!app.close_state.requested);
+        // A repeated close attempt must not bypass the pending save.
+        app.request_close(&ctx);
+        assert!(app.close_after_save);
+        assert!(!app.close_state.requested);
+        sender.send(Ok(())).unwrap();
+        app.poll_save(&ctx);
+        assert!(!app.close_after_save);
+    }
+
+    #[test]
+    fn save_as_target_identity_handles_dot_segments_symlinks_and_platform_case() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("a.png");
+        std::fs::write(&file, b"x").unwrap();
+        let dotted = dir.path().join(".").join("a.png");
+        assert!(same_save_target(&file, &dotted));
+        assert!(same_save_target(&dotted, &file));
+        assert!(same_save_target(&file, &file));
+        let other = dir.path().join("b.png");
+        std::fs::write(&other, b"x").unwrap();
+        assert!(!same_save_target(&file, &other));
+        assert!(!same_save_target(
+            Path::new("/tmp/x/../y/a.png"),
+            Path::new("/tmp/x/a.png")
+        ));
+
+        // Nonexistent target behind a symlinked parent keeps one identity.
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+            assert!(same_save_target(
+                &dir.path().join("future.png"),
+                &alias.join("future.png")
+            ));
+            assert!(!same_save_target(
+                &dir.path().join("future.png"),
+                &alias.join("different.png")
+            ));
+        }
+
+        // Relative and absolute spellings agree.
+        let cwd = std::env::current_dir().unwrap();
+        let relative = Path::new("oxeye-future-target.png");
+        assert!(same_save_target(relative, &cwd.join(relative)));
+
+        let case_insensitive = cfg!(any(target_os = "windows", target_os = "macos"));
+        assert_eq!(
+            same_save_target(Path::new("/tmp/x/A.PNG"), Path::new("/tmp/x/a.png")),
+            case_insensitive,
+            "case folding follows the platform's default filesystem"
+        );
+        assert_eq!(
+            same_save_target(Path::new("/tmp/x/Ä.png"), Path::new("/tmp/x/ä.png")),
+            case_insensitive,
+            "non-ASCII case folding uses Unicode lowercasing"
+        );
+        assert!(
+            !same_save_target(Path::new("/tmp/x/Ä.png"), Path::new("/tmp/x/ö.png")),
+            "different names stay different"
+        );
+    }
+
+    #[test]
+    fn successful_ops_drop_the_crop_but_failed_ops_keep_it() {
+        let ctx = egui::Context::default();
+        let mut app = editing_fixture();
+        app.enter_crop();
+        assert!(app.crop_active());
+        app.perform(Action::RotateRight, Rect::NOTHING, &ctx);
+        assert!(!app.crop_active());
+        assert!(app.edit_ui.as_ref().unwrap().session.dirty());
+
+        app.enter_crop();
+        let before = app.edit_ui.as_ref().unwrap().crop.as_ref().unwrap().rect;
+        app.apply_edit_op(
+            edit::EditOp::Crop(edit::PixelRect {
+                x: 99,
+                y: 99,
+                w: 1,
+                h: 1,
+            }),
+            &ctx,
+        );
+        let after = app.edit_ui.as_ref().unwrap().crop.as_ref().unwrap().rect;
+        assert_eq!(before, after, "a rejected crop must not drop the selection");
+
+        app.perform(Action::FlipHorizontal, Rect::NOTHING, &ctx);
+        app.enter_crop();
+        app.perform(Action::UndoEdit, Rect::NOTHING, &ctx);
+        assert!(!app.crop_active(), "undo also changes dimensions");
+    }
+
+    #[test]
+    fn c_starts_crop_and_reuses_the_same_session() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        install_fixture(&mut app, 0);
+        app.perform(Action::Edit, Rect::NOTHING, &ctx);
+        assert!(app.editing());
+        assert!(app.crop_active());
+        app.perform(Action::FlipHorizontal, Rect::NOTHING, &ctx);
+        assert!(app.edit_ui.as_ref().unwrap().session.dirty());
+        app.perform(Action::Edit, Rect::NOTHING, &ctx);
+        assert!(app.crop_active());
+        assert!(
+            app.edit_ui.as_ref().unwrap().session.dirty(),
+            "pressing C in edit mode must not start a new session"
+        );
+    }
+
+    #[test]
+    fn book_edit_restores_the_pre_entry_display_rotation() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        install_fixture(&mut app, 1);
+        app.settings.reading_mode = ReadingMode::Book;
+        app.display_mode = ReadingMode::Book;
+        let rotation = app.rotation;
+        let source = app.media.as_ref().unwrap().source.clone();
+        app.begin_edit(&ctx, rotation, Some(ReadingMode::Book), source, false);
+        assert_eq!(app.dimensions, (3, 4));
+        app.perform(Action::EditExit, Rect::NOTHING, &ctx);
+        assert_eq!(app.rotation.displayed, 1);
+        assert_eq!(app.rotation.requested, 1);
+        assert_eq!(app.settings.reading_mode, ReadingMode::Book);
+        app.loader.cancel();
+    }
+
+    #[test]
+    fn slow_crop_moves_accumulate_subpixel_motion() {
+        let origin = edit::PixelRect {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 2,
+        };
+        let anchor = [0., 0.];
+        let first = moved_crop(origin, anchor, [0.2, 0.2], (100, 100));
+        let middle = moved_crop(origin, anchor, [0.4, 0.4], (100, 100));
+        let end = moved_crop(origin, anchor, [0.6, 0.6], (100, 100));
+        assert_eq!(first.x, 0);
+        assert_eq!(middle.x, 0);
+        assert_eq!(end.x, 1, "the total delta must not be rounded per frame");
+        assert_eq!(end.y, 1);
+        // Clamping still applies to the composed delta.
+        let clamped = moved_crop(origin, anchor, [500., 500.], (100, 100));
+        assert_eq!(clamped.x, 98);
+        assert_eq!(clamped.y, 98);
+    }
+
+    fn fixture_media(source: SourceRef, pixels: Arc<RgbaImage>) -> Arc<model::LoadedMedia> {
+        Arc::new(model::LoadedMedia {
+            source,
+            frames: vec![model::MediaFrame {
+                pixels,
+                delay: Duration::ZERO,
+            }],
+            loop_mode: model::LoopMode::Once,
+        })
+    }
+
+    #[test]
+    fn overwrite_reload_applies_the_baked_rotation_only_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rotated.png");
+        let original =
+            RgbaImage::from_fn(4, 3, |x, y| image::Rgba([(y * 4 + x + 1) as u8, 0, 0, 255]));
+        original.save(&path).unwrap();
+        let source = SourceRef::file(&path);
+        let pixels = Arc::new(original);
+        let mut app = test_app();
+        app.settings.reading_mode = ReadingMode::Single;
+        app.display_mode = ReadingMode::Single;
+        app.media = Some(fixture_media(source.clone(), Arc::clone(&pixels)));
+        app.tiled = Some(Arc::new(
+            prepare_tiles(&pixels, MAX_TILE, &AtomicBool::new(false)).unwrap(),
+        ));
+        app.selected = Some(source.clone());
+        app.displayed = Some(source.clone());
+        app.current_file = Some(source.clone());
+        app.siblings = vec![source.clone()];
+        app.dimensions = (4, 3);
+        app.rotation.commit(1);
+        let ctx = egui::Context::default();
+        let rotation = app.rotation;
+        app.begin_edit(&ctx, rotation, None, source.clone(), false);
+        let saved = (**app.edit_ui.as_ref().unwrap().session.preview()).clone();
+        assert_eq!(saved.dimensions(), (3, 4));
+        export::atomic_write(&path, &saved, export::ExportFormat::Png, 90).unwrap();
+
+        // Hold the loader so the reload request is inspectable.
+        app.loader.running = true;
+        app.finish_overwrite(&ctx);
+        assert_eq!(
+            app.rotation.displayed, 0,
+            "an overwrite must not keep the pre-edit display rotation"
+        );
+        assert_eq!(app.rotation.requested, 0);
+        let turns = match app.loader.pending.as_ref().map(|(_, work)| work) {
+            Some(Work::Load(_, _, _, _, _, _, _, turns)) => *turns,
+            _ => panic!("overwrite did not queue a reload"),
+        };
+        assert_eq!(turns, 0, "the saved pixels already contain the rotation");
+        let (revision, work) = app.loader.pending.take().unwrap();
+        app.loader.running = false;
+        let prepared = prepare(work, &AtomicBool::new(false)).image.unwrap();
+        assert_eq!(prepared.turns, 0);
+        assert_eq!(prepared.media.frames[0].pixels.as_ref(), &saved);
+        app.candidate = Some(Candidate {
+            revision,
+            image: prepared,
+            painted_frame: None,
+        });
+        app.commit_candidate(&ctx);
+        assert_eq!(app.rotation.displayed, 0);
+        assert_eq!(
+            app.media.as_ref().unwrap().frames[0].pixels.as_ref(),
+            &saved,
+            "reload must show the once-rotated file, not rotate again"
+        );
+    }
+
+    #[test]
+    fn layout_correction_reload_keeps_the_prepared_turns() {
+        let wide = SourceRef::file(Path::new("wide.png"));
+        let tall = SourceRef::file(Path::new("tall.png"));
+        let wide_pixels = Arc::new(RgbaImage::from_pixel(40, 10, image::Rgba([1, 0, 0, 255])));
+        let tall_pixels = Arc::new(RgbaImage::from_pixel(10, 40, image::Rgba([2, 0, 0, 255])));
+        let mut app = test_app();
+        app.settings.reading_mode = ReadingMode::Book;
+        app.settings.auto_wide = true;
+        app.display_mode = ReadingMode::Book;
+        app.siblings = vec![wide.clone(), tall.clone()];
+        app.selected = Some(wide.clone());
+        app.displayed = Some(wide.clone());
+        app.current_file = Some(wide.clone());
+        let ctx = egui::Context::default();
+        let prepared = prepare_spread(
+            vec![
+                fixture_media(wide.clone(), wide_pixels),
+                fixture_media(tall.clone(), tall_pixels),
+            ],
+            &[0, 0],
+            1,
+            true,
+            MAX_TILE,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        app.loader.running = true;
+        app.candidate = Some(Candidate {
+            revision: app.loader.revision,
+            image: prepared,
+            painted_frame: None,
+        });
+        app.commit_candidate(&ctx);
+        let turns = match app.loader.pending.as_ref().map(|(_, work)| work) {
+            Some(Work::Load(_, _, _, _, _, _, _, turns)) => *turns,
+            _ => panic!("layout correction did not queue a reload"),
+        };
+        assert_eq!(
+            turns, 1,
+            "a correction reload must keep the displayed turns"
+        );
+
+        // Ordinary navigation still starts from an unrotated file.
+        app.load(&ctx, tall, true);
+        let turns = match app.loader.pending.as_ref().map(|(_, work)| work) {
+            Some(Work::Load(_, _, _, _, _, _, _, turns)) => *turns,
+            _ => panic!("navigation did not queue a load"),
+        };
+        assert_eq!(turns, 0);
+    }
+
+    #[test]
+    fn cancelling_a_committed_pending_edit_rebuilds_the_book_view() {
+        let ctx = egui::Context::default();
+        let mut app = pending_book_fixture(false);
+        app.loader.cancel();
+        app.loader.running = false;
+        app.candidate = None;
+        app.loading_file = false;
+        let pending = app.edit_pending.as_ref().unwrap();
+        let source = pending.source.clone();
+        let rotation = pending.rotation;
+        let restore = pending.restore;
+        let pixels = Arc::new(RgbaImage::new(2, 2));
+        app.media = Some(Arc::new(model::LoadedMedia {
+            source: source.clone(),
+            frames: (0..2)
+                .map(|_| model::MediaFrame {
+                    pixels: Arc::clone(&pixels),
+                    delay: Duration::ZERO,
+                })
+                .collect(),
+            loop_mode: model::LoopMode::Once,
+        }));
+        app.selected = Some(source.clone());
+        app.displayed = Some(source.clone());
+        app.current_file = Some(source.clone());
+        app.display_mode = ReadingMode::Single;
+        app.rotation = rotation;
+        app.resolve_pending_edit(&ctx);
+        assert!(app.edit_pending.is_none());
+        assert_eq!(app.settings.reading_mode, restore);
+        assert_eq!(app.display_mode, ReadingMode::Book);
+        assert_eq!(app.rotation.displayed, rotation.displayed);
+        assert_eq!(app.media.as_ref().unwrap().source, source);
+        assert!(
+            app.loading_file,
+            "the Book view is rebuilt from the edited page"
+        );
+        app.loader.cancel();
+    }
+
+    #[test]
+    fn close_request_blocks_new_saves_and_failed_saves_stay_open() {
+        let ctx = egui::Context::default();
+        let mut app = editing_fixture();
+        app.close_state.requested = true;
+        app.start_save(
+            PathBuf::from("copy.png"),
+            export::ExportFormat::Png,
+            false,
+            &ctx,
+        );
+        assert!(app.edit_ui.as_ref().unwrap().saving.is_none());
+        assert_eq!(
+            app.feedback
+                .notice
+                .as_ref()
+                .map(|notice| notice.text.as_str()),
+            Some(app.text().save_blocked_closing)
+        );
+
+        app.close_state.requested = false;
+        let (sender, receiver) = mpsc::channel();
+        app.edit_ui.as_mut().unwrap().saving = Some(SaveJob {
+            receiver,
+            overwrite: false,
+            path: PathBuf::from("copy.png"),
+        });
+        app.request_close(&ctx);
+        assert!(app.close_after_save);
+        sender.send(Err("disk full".into())).unwrap();
+        app.poll_save(&ctx);
+        assert!(
+            !app.close_after_save,
+            "a failed save must keep the window open"
+        );
+        assert!(!app.close_state.requested);
+        assert!(app.editing());
+        assert!(!app.save_delays_close(&ctx, false));
     }
 }
