@@ -3,6 +3,9 @@
 mod model;
 mod navigation;
 mod preload;
+// Override APIs stay unused until the wide-page UI lands.
+#[allow(dead_code)]
+mod progress;
 mod settings;
 mod spread_playback;
 mod thumb_ui;
@@ -40,6 +43,7 @@ use model::DecodePurpose;
 use model::source::{SourceRef, catalog_for, source_identity};
 use navigation::Navigation;
 use preload::{CacheStats, ForegroundToken, Prefetcher};
+use progress::{PageOverride, ProgressStore};
 use settings::{ComicArrowDirection, ReadingMode};
 use thumb_ui::{
     CELL_WIDTH, STRIP_HEIGHT, cell_at, clamp_offset, request_range, reveal_offset, visible_range,
@@ -169,6 +173,13 @@ const SETTING_RESTORE: usize = 7;
 const SETTING_CANCEL: usize = 8;
 const SETTING_APPLY: usize = 9;
 const SETTING_COUNT: usize = 10;
+
+/// Wide-page overrides stay empty until the wide-page UI lands; keep the
+/// stored policy type wired in now.
+const _: PageOverride = PageOverride::Auto;
+
+/// Reading progress is small; one write after the page settles is enough.
+const PROGRESS_SAVE_DELAY: Duration = Duration::from_millis(500);
 
 fn next_settings_control(current: usize, backwards: bool) -> usize {
     (current + if backwards { SETTING_COUNT - 1 } else { 1 }) % SETTING_COUNT
@@ -1091,6 +1102,9 @@ impl ThumbTextures {
 struct Oxeye {
     initial: Option<PathBuf>,
     settings: AppSettings,
+    progress: ProgressStore,
+    progress_dirty: bool,
+    progress_due: Option<Instant>,
     prefetch: Prefetcher,
     loader: Loader,
     worker_tx: Sender<Completion>,
@@ -1160,23 +1174,40 @@ impl Oxeye {
         settings: AppSettings,
         warning: Option<String>,
     ) -> Self {
+        Self::from_parts(initial, settings, warning, ProgressStore::load())
+    }
+
+    fn from_parts(
+        initial: Option<PathBuf>,
+        settings: AppSettings,
+        warning: Option<String>,
+        progress: ProgressStore,
+    ) -> Self {
         let display_mode = settings.reading_mode;
         let language = resolve_language(settings.language);
         let prefetch = Prefetcher::new(settings.prefetch.clone());
         prefetch.set_purpose(DecodePurpose::Animated);
         let thumbnails = Thumbnails::new(prefetch.clone());
         let mut feedback = Feedback::default();
+        let text = ui_text::catalog(language);
+        let mut warnings = Vec::new();
         if let Some(warning) = warning {
-            feedback.replace(
-                FeedbackKind::Error,
-                ui_text::catalog(language).settings_warning(&warning),
-            );
+            warnings.push(text.settings_warning(&warning));
+        }
+        if let Some(warning) = progress.warning.as_deref() {
+            warnings.push(text.progress_warning(warning));
+        }
+        if !warnings.is_empty() {
+            feedback.replace(FeedbackKind::Error, warnings.join("\n"));
         }
         let (worker_tx, worker_rx) = mpsc::channel();
         let (save_tx, save_rx) = mpsc::channel();
         Self {
             initial,
             settings,
+            progress,
+            progress_dirty: false,
+            progress_due: None,
             prefetch,
             loader: Loader::default(),
             worker_tx,
@@ -1283,6 +1314,60 @@ impl Oxeye {
         }
     }
 
+    /// Committed page positions are debounced; closing forces the write.
+    /// A failed save stays dirty for the next commit or close attempt.
+    fn flush_progress(&mut self, ctx: &egui::Context, force: bool) -> Result<(), String> {
+        if !self.progress_dirty {
+            return Ok(());
+        }
+        if !force {
+            let Some(due) = self.progress_due else {
+                return Ok(());
+            };
+            let now = Instant::now();
+            if now < due {
+                ctx.request_repaint_after(due - now);
+                return Ok(());
+            }
+        }
+        self.progress_due = None;
+        self.progress.save()?;
+        self.progress_dirty = false;
+        Ok(())
+    }
+
+    fn record_progress(&mut self, ctx: &egui::Context) {
+        // An unusable store was already reported at startup; keep retrying
+        // would replace that warning with one error per page.
+        if self.progress.warning.is_some() {
+            return;
+        }
+        let Some(source) = self.selected.clone() else {
+            return;
+        };
+        if self.progress.record(&source).is_err() {
+            return;
+        }
+        self.progress_dirty = true;
+        self.progress_due = Some(Instant::now() + PROGRESS_SAVE_DELAY);
+        ctx.request_repaint_after(PROGRESS_SAVE_DELAY);
+    }
+
+    /// A close-time progress failure is reported but never blocks the exit.
+    fn flush_progress_for_close(&mut self, ctx: &egui::Context) -> bool {
+        match self.flush_progress(ctx, true) {
+            Ok(()) => false,
+            Err(error) => {
+                self.set_feedback(
+                    FeedbackKind::Error,
+                    self.text().progress_save_failed(&error),
+                    ctx,
+                );
+                true
+            }
+        }
+    }
+
     fn persist_settings(&mut self, ctx: &egui::Context, message: &str) {
         self.save_revision += 1;
         let start = self
@@ -1314,6 +1399,8 @@ impl Oxeye {
             self.set_feedback(kind, message, ctx);
             self.sync_prefetch(ctx);
             if close {
+                // A page may have committed while the settings save ran.
+                self.flush_progress_for_close(ctx);
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
         }
@@ -1796,14 +1883,29 @@ impl Oxeye {
         let result = catalog_for(&path)
             .and_then(|catalog| {
                 let file = SourceRef::file(&path);
-                let selected = catalog
-                    .items
-                    .iter()
-                    .find(|source| **source == file)
-                    .or_else(|| catalog.items.first())
-                    .cloned()
+                let items = catalog.items;
+                // Only archives carry a fingerprint; a folder keeps following
+                // the file that was actually opened.
+                let restored = items
+                    .first()
+                    .filter(|source| source.is_archive())
+                    .and_then(|source| self.progress.restore(source))
+                    .and_then(|progress| {
+                        items
+                            .iter()
+                            .find(|source| match source {
+                                SourceRef::Archive { index, name, .. } => {
+                                    *index == progress.entry_index && *name == progress.entry_name
+                                }
+                                SourceRef::File(_) => false,
+                            })
+                            .cloned()
+                    });
+                let selected = restored
+                    .or_else(|| items.iter().find(|source| **source == file).cloned())
+                    .or_else(|| items.first().cloned())
                     .ok_or_else(|| self.text().no_images.to_owned())?;
-                Ok((selected, catalog.items))
+                Ok((selected, items))
             })
             .or_else(|error| {
                 if model::supported_path(&path) {
@@ -2053,6 +2155,11 @@ impl Oxeye {
         self.other_pages = prepared.others;
         self.media = Some(prepared.media);
         self.tiled = Some(prepared.tiled);
+        // Record the committed page before navigation_painted starts a queued
+        // load, which replaces `selected` with the next, not-yet-shown page.
+        if loaded {
+            self.record_progress(ctx);
+        }
         self.navigation_painted(candidate.revision, ctx);
         if loaded {
             self.reveal_thumbnails();
@@ -2492,7 +2599,14 @@ impl Oxeye {
             return;
         }
         self.cancel_navigation();
-        if self.close_state.request(self.save_revision) {
+        let close = self.close_state.request(self.save_revision);
+        let progress_error = if close {
+            false
+        } else {
+            self.flush_progress_for_close(ctx)
+        };
+        if close {
+            self.flush_progress_for_close(ctx);
             self.close_pending_notice = false;
             ctx.send_viewport_cmd(ViewportCommand::Close);
         } else {
@@ -2501,11 +2615,13 @@ impl Oxeye {
             }
             if !self.close_pending_notice {
                 self.close_pending_notice = true;
-                self.set_feedback(
-                    FeedbackKind::Progress,
-                    self.text().saving_before_close.to_owned(),
-                    ctx,
-                );
+                if !progress_error {
+                    self.set_feedback(
+                        FeedbackKind::Progress,
+                        self.text().saving_before_close.to_owned(),
+                        ctx,
+                    );
+                }
             }
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
         }
@@ -2513,7 +2629,14 @@ impl Oxeye {
 
     fn request_close(&mut self, ctx: &egui::Context) {
         self.cancel_navigation();
-        if self.close_state.request(self.save_revision) {
+        let close = self.close_state.request(self.save_revision);
+        let progress_error = if close {
+            false
+        } else {
+            self.flush_progress_for_close(ctx)
+        };
+        if close {
+            self.flush_progress_for_close(ctx);
             self.close_pending_notice = false;
             ctx.send_viewport_cmd(ViewportCommand::Close);
         } else {
@@ -2522,11 +2645,13 @@ impl Oxeye {
             }
             if !self.close_pending_notice {
                 self.close_pending_notice = true;
-                self.set_feedback(
-                    FeedbackKind::Progress,
-                    self.text().saving_before_close.to_owned(),
-                    ctx,
-                );
+                if !progress_error {
+                    self.set_feedback(
+                        FeedbackKind::Progress,
+                        self.text().saving_before_close.to_owned(),
+                        ctx,
+                    );
+                }
             }
         }
         ctx.request_repaint();
@@ -3685,6 +3810,13 @@ impl eframe::App for Oxeye {
             .input(|input| input.viewport().fullscreen)
             .unwrap_or(self.fullscreen);
         self.handle_close_request(ctx);
+        if let Err(error) = self.flush_progress(ctx, false) {
+            self.set_feedback(
+                FeedbackKind::Error,
+                self.text().progress_save_failed(&error),
+                ctx,
+            );
+        }
         self.expire_feedback(ctx);
         self.poll_saves(ctx);
         if !self.close_state.requested && self.settings_draft.is_some() {
@@ -3796,19 +3928,29 @@ mod tests {
         }
     }
 
-    fn test_app() -> Oxeye {
-        Oxeye::from_settings(
-            None,
-            AppSettings {
-                language: Language::English,
-                prefetch: PrefetchSettings {
-                    before: 0,
-                    after: 2,
-                    memory_mib: 8,
-                },
-                ..Default::default()
+    fn test_settings() -> AppSettings {
+        AppSettings {
+            language: Language::English,
+            prefetch: PrefetchSettings {
+                before: 0,
+                after: 2,
+                memory_mib: 8,
             },
+            ..Default::default()
+        }
+    }
+
+    fn test_app() -> Oxeye {
+        // A path that must not exist: these tests never persist progress.
+        test_app_at(Path::new("oxeye-test-progress.json"))
+    }
+
+    fn test_app_at(progress: &Path) -> Oxeye {
+        Oxeye::from_parts(
             None,
+            test_settings(),
+            None,
+            ProgressStore::load_from(progress),
         )
     }
 
@@ -3972,6 +4114,232 @@ mod tests {
     }
 
     #[test]
+    fn reopening_an_archive_restores_the_last_committed_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        write_comic(&archive);
+        let progress = directory.path().join("progress.json");
+        let ctx = egui::Context::default();
+
+        let mut app = test_app_at(&progress);
+        app.open_path(archive.clone(), &ctx);
+        let sources = app.siblings.clone();
+        finish_load(&mut app, &ctx);
+        app.load(&ctx, sources[2].clone(), false);
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.selected, Some(sources[2].clone()));
+        app.flush_progress(&ctx, true).unwrap();
+        assert!(progress.exists());
+
+        let mut reopened = test_app_at(&progress);
+        reopened.open_path(archive, &ctx);
+        assert_eq!(reopened.selected, Some(sources[2].clone()));
+        finish_load(&mut reopened, &ctx);
+        assert_eq!(reopened.displayed, Some(sources[2].clone()));
+        assert_eq!(reopened.position_label(), "3 / 3");
+    }
+
+    #[test]
+    fn progress_records_on_commit_and_waits_for_the_debounce() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        write_comic(&archive);
+        let progress = directory.path().join("progress.json");
+        let ctx = egui::Context::default();
+
+        let mut app = test_app_at(&progress);
+        app.open_path(archive, &ctx);
+        let sources = app.siblings.clone();
+        finish_load(&mut app, &ctx);
+        assert!(app.progress_dirty);
+        assert!(app.progress_due.is_some());
+
+        app.flush_progress(&ctx, false).unwrap();
+        assert!(app.progress_dirty, "a pending debounce must not write yet");
+        assert!(!progress.exists());
+
+        app.flush_progress(&ctx, true).unwrap();
+        assert!(!app.progress_dirty);
+        assert!(app.progress_due.is_none());
+        let store = ProgressStore::load_from(&progress);
+        let restored = store.restore(&sources[0]).unwrap();
+        assert_eq!(restored.entry_index, 2);
+        assert_eq!(restored.entry_name, "chapter/page1.png");
+    }
+
+    #[test]
+    fn changed_archive_fingerprint_ignores_saved_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        write_comic(&archive);
+        let progress = directory.path().join("progress.json");
+        let ctx = egui::Context::default();
+
+        let mut app = test_app_at(&progress);
+        app.open_path(archive.clone(), &ctx);
+        let sources = app.siblings.clone();
+        finish_load(&mut app, &ctx);
+        app.load(&ctx, sources[2].clone(), false);
+        finish_load(&mut app, &ctx);
+        app.flush_progress(&ctx, true).unwrap();
+
+        let first = png_bytes(1);
+        let second = png_bytes(2);
+        let third = png_bytes(3);
+        let tenth = png_bytes(10);
+        model::source::test_support::write_zip(
+            &archive,
+            &[
+                ("chapter/page10.png", &tenth),
+                ("chapter/page2.png", &second),
+                ("chapter/page1.png", &first),
+                ("readme.txt", b"not a page"),
+                ("chapter/page3.png", &third),
+            ],
+        );
+
+        let mut reopened = test_app_at(&progress);
+        reopened.open_path(archive, &ctx);
+        let pages = reopened.siblings.clone();
+        assert!(
+            reopened.progress.restore(&pages[0]).is_none(),
+            "the rewritten archive has a new fingerprint"
+        );
+        assert_eq!(
+            reopened.selected,
+            Some(pages[0].clone()),
+            "stale progress must not select the old page"
+        );
+        finish_load(&mut reopened, &ctx);
+        assert_eq!(reopened.display_name(), "comic.cbz / page1.png");
+    }
+
+    #[test]
+    fn closing_saves_a_pending_reading_position() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        write_comic(&archive);
+        let progress = directory.path().join("progress.json");
+        let ctx = egui::Context::default();
+
+        let mut app = test_app_at(&progress);
+        app.open_path(archive, &ctx);
+        let sources = app.siblings.clone();
+        finish_load(&mut app, &ctx);
+        app.load(&ctx, sources[2].clone(), false);
+        finish_load(&mut app, &ctx);
+        assert!(app.progress_dirty);
+
+        app.request_close(&ctx);
+        assert!(!app.progress_dirty);
+        let restored = ProgressStore::load_from(&progress)
+            .restore(&sources[2])
+            .unwrap();
+        assert_eq!(
+            (restored.entry_index, restored.entry_name.as_str()),
+            (0, "chapter/page10.png")
+        );
+    }
+
+    #[test]
+    fn folder_open_ignores_saved_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("1.png");
+        let second = directory.path().join("2.png");
+        std::fs::write(&first, png_bytes(1)).unwrap();
+        std::fs::write(&second, png_bytes(2)).unwrap();
+        let progress = directory.path().join("progress.json");
+        let ctx = egui::Context::default();
+
+        let mut app = test_app_at(&progress);
+        app.open_path(first.clone(), &ctx);
+        finish_load(&mut app, &ctx);
+        app.flush_progress(&ctx, true).unwrap();
+
+        let mut reopened = test_app_at(&progress);
+        reopened.open_path(second.clone(), &ctx);
+        assert_eq!(reopened.selected, Some(SourceRef::file(&second)));
+        finish_load(&mut reopened, &ctx);
+        assert_eq!(reopened.display_name(), "2.png");
+    }
+
+    #[test]
+    fn queued_next_page_does_not_replace_progress_when_its_load_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        let cover = png_bytes(1);
+        model::source::test_support::write_zip(
+            &archive,
+            &[("cover.png", &cover), ("next.png", b"not an image")],
+        );
+        let progress = directory.path().join("progress.json");
+        let ctx = egui::Context::default();
+
+        let mut app = test_app_at(&progress);
+        app.open_path(archive, &ctx);
+        // Queue the next page while the cover is still loading.
+        app.perform(Action::Next, Rect::NOTHING, &ctx);
+        finish_load(&mut app, &ctx);
+        finish_load(&mut app, &ctx);
+        assert!(
+            app.error.is_some(),
+            "the queued next page must fail to decode"
+        );
+        app.flush_progress(&ctx, true).unwrap();
+
+        let cover_source = app.siblings[0].clone();
+        let restored = ProgressStore::load_from(&progress)
+            .restore(&cover_source)
+            .unwrap();
+        assert_eq!(restored.entry_name, "cover.png");
+    }
+
+    #[test]
+    fn final_close_flushes_progress_committed_while_settings_save_was_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        write_comic(&archive);
+        let progress = directory.path().join("progress.json");
+        let ctx = egui::Context::default();
+
+        let mut app = test_app_at(&progress);
+        app.open_path(archive, &ctx);
+        let sources = app.siblings.clone();
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.selected, Some(sources[0].clone()));
+
+        // A page is in flight when closing starts; a settings save is pending.
+        app.load(&ctx, sources[1].clone(), false);
+        app.save_revision = 1;
+        app.request_close(&ctx);
+        assert!(
+            app.close_state.requested,
+            "the settings save should gate the close"
+        );
+
+        // The in-flight page commits while the close waits for the save.
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.selected, Some(sources[1].clone()));
+        assert!(app.progress_dirty);
+
+        app.save_tx
+            .send(SaveDone {
+                revision: 1,
+                result: Ok(()),
+            })
+            .unwrap();
+        wait_until(|| {
+            app.poll_saves(&ctx);
+            !app.close_state.requested
+        });
+        assert!(!app.progress_dirty);
+        let restored = ProgressStore::load_from(&progress)
+            .restore(&sources[1])
+            .unwrap();
+        assert_eq!(restored.entry_name, "chapter/page2.png");
+    }
+
+    #[test]
     fn folder_open_keeps_selected_file_siblings_previews_and_copy() {
         let directory = tempfile::tempdir().unwrap();
         let first = directory.path().join("1.png");
@@ -4034,6 +4402,11 @@ mod tests {
                 let first_page = app.siblings[0].clone();
                 app.load(&ctx, app.siblings[1].clone(), false);
                 finish_load(&mut app, &ctx);
+                // Reopening now restores the committed page; this test checks
+                // prefetch reuse, so start it without a saved position.
+                app.progress = ProgressStore::load_from(Path::new("oxeye-test-progress.json"));
+                app.progress_dirty = false;
+                app.progress_due = None;
                 first_page
             } else {
                 SourceRef::file(&second)
