@@ -1818,9 +1818,10 @@ mod tests {
     fn archive_fingerprint_keeps_nanoseconds_and_defaults_pre_epoch_times() {
         use std::time::Duration;
         let epoch = SystemTime::UNIX_EPOCH;
+        // Windows file times have 100 ns granularity; use a representable value.
         assert_eq!(
-            archive_fingerprint((12, epoch + Duration::new(34, 56))),
-            (12, 34, 56)
+            archive_fingerprint((12, epoch + Duration::new(34, 5_600))),
+            (12, 34, 5_600)
         );
         assert_eq!(
             archive_fingerprint((12, epoch - Duration::from_secs(1))),
