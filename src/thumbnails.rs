@@ -17,6 +17,7 @@
 //! priority or whole-process memory claim.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -268,6 +269,7 @@ impl Thumbnails {
     /// same paths and generation is a no-op so a UI refresh cannot reset the
     /// worker or starve a path. An empty set clears the CPU cache and cancels
     /// the current job.
+    #[cfg(test)]
     pub fn set_visible(&self, paths: Vec<PathBuf>, generation: u64) {
         self.set_visible_sources(
             paths.iter().map(|path| SourceRef::file(path)).collect(),
@@ -323,6 +325,7 @@ impl Thumbnails {
     /// Returns an already validated thumbnail. Pure cache lookup: no file I/O,
     /// no decode. A missing or not-yet-current-epoch entry is `None`; the UI
     /// draws its placeholder.
+    #[cfg(test)]
     pub fn get(&self, path: &Path) -> Option<Arc<RgbaImage>> {
         self.get_source(&SourceRef::file(path))
     }
@@ -630,7 +633,6 @@ mod tests {
     fn media(path: &Path, width: u32, height: u32) -> LoadedMedia {
         LoadedMedia {
             source: SourceRef::file(path),
-            path: path.to_path_buf(),
             frames: vec![MediaFrame {
                 pixels: Arc::new(RgbaImage::from_pixel(
                     width,
@@ -812,7 +814,6 @@ mod tests {
             *slot.lock().expect("weak slot") = Some(Arc::downgrade(&pixels));
             Ok(LoadedMedia {
                 source: SourceRef::file(path),
-                path: path.to_path_buf(),
                 frames: vec![MediaFrame {
                     pixels,
                     delay: Duration::ZERO,

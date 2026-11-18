@@ -2,8 +2,10 @@ use crate::{
     navigation::{Navigation, NavigationQueue},
     settings::{AppSettings, ComicArrowDirection, ReadingMode},
 };
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 pub fn selected_index(selected: Option<&Path>, siblings: &[PathBuf]) -> Option<usize> {
     let selected = selected?;
     siblings.iter().position(|path| path == selected)

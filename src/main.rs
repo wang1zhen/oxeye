@@ -37,6 +37,7 @@ use settings::{Language, resolve_language};
 use spread_playback::{PageTiming, SpreadPlayback};
 
 use model::DecodePurpose;
+use model::source::{SourceRef, catalog_for, source_identity};
 use navigation::Navigation;
 use preload::{CacheStats, ForegroundToken, Prefetcher};
 use settings::{ComicArrowDirection, ReadingMode};
@@ -46,7 +47,7 @@ use thumb_ui::{
 use thumbnails::Thumbnails;
 use ui_state::{
     Feedback, FeedbackKind, NavigationFlow, NavigationTicket, horizontal_navigation,
-    restore_defaults, selected_index,
+    restore_defaults,
 };
 use viewer::{Playback, TiledFrame, intersects, prepare_tiles, spread_layout};
 
@@ -316,14 +317,34 @@ fn reading_mode_changed(active: &AppSettings, draft: &AppSettings) -> bool {
 /// Keep the file the user last chose when switching layouts, not just the
 /// spread anchor that Book navigation stores as `selected`.
 fn mode_target(
-    current_file: &Option<PathBuf>,
-    selected: &Option<PathBuf>,
-    displayed: &Option<PathBuf>,
-) -> Option<PathBuf> {
+    current_file: &Option<SourceRef>,
+    selected: &Option<SourceRef>,
+    displayed: &Option<SourceRef>,
+) -> Option<SourceRef> {
     current_file
         .clone()
         .or_else(|| selected.clone())
         .or_else(|| displayed.clone())
+}
+
+fn source_index(selected: Option<&SourceRef>, siblings: &[SourceRef]) -> Option<usize> {
+    let selected = selected?;
+    siblings.iter().position(|source| source == selected)
+}
+
+fn source_label(source: &SourceRef) -> String {
+    if let Some(archive) = source.archive_root() {
+        format!(
+            "{} / {}",
+            archive
+                .file_name()
+                .unwrap_or(archive.as_os_str())
+                .to_string_lossy(),
+            source.display_name()
+        )
+    } else {
+        source.display_name()
+    }
 }
 
 /// A commit or navigation step must cross a later completed output frame.
@@ -367,7 +388,7 @@ fn adjacent_index(current: usize, length: usize, next: bool) -> Option<usize> {
 }
 
 /// Explicit opens and drops discard the FIFO rather than reusing old targets.
-fn reset_navigation(flow: &mut NavigationFlow, paths: &mut Vec<PathBuf>) {
+fn reset_navigation(flow: &mut NavigationFlow, paths: &mut Vec<SourceRef>) {
     flow.clear();
     paths.clear();
 }
@@ -381,7 +402,7 @@ enum Zoom {
 
 enum Work {
     Load(
-        PathBuf,
+        SourceRef,
         Prefetcher,
         ForegroundToken,
         u32,
@@ -414,7 +435,7 @@ struct Completion {
 }
 
 struct WorkResult {
-    selection: Option<(PathBuf, Result<Vec<PathBuf>, String>)>,
+    selection: Option<(SourceRef, Result<Vec<SourceRef>, String>)>,
     image: Result<Prepared, String>,
     animation: Option<Result<SpreadUpdate, String>>,
 }
@@ -630,20 +651,13 @@ fn prepare(work: Work, cancelled: &AtomicBool) -> WorkResult {
     }
     match work {
         Work::Load(path, prefetch, foreground, cap, mode, language) => {
-            let path = match std::path::absolute(path) {
-                Ok(path) => path,
-                Err(error) => {
-                    return WorkResult {
-                        selection: None,
-                        image: Err(
-                            ui_text::catalog(language).path_failed_detail(&error.to_string())
-                        ),
-                        animation: None,
-                    };
-                }
-            };
             // Scan even when decoding fails, so a corrupt first file does not trap navigation.
-            let siblings = model::sibling_images(&path);
+            let siblings = match &path {
+                SourceRef::File(file) => model::sibling_images(file)
+                    .map(|paths| paths.into_iter().map(SourceRef::File).collect()),
+                SourceRef::Archive { .. } => catalog_for(path.path()).map(|catalog| catalog.items),
+            }
+            .map_err(|error| ui_text::catalog(language).open_failed(&path.to_string(), &error));
             let targets = siblings
                 .as_ref()
                 .ok()
@@ -658,16 +672,21 @@ fn prepare(work: Work, cancelled: &AtomicBool) -> WorkResult {
                 .unwrap_or_else(|| vec![path.clone()]);
             let selected = targets.first().cloned().unwrap_or_else(|| path.clone());
             let image = (|| {
-                let clicked = prefetch.load(&path, cancelled)?;
+                if path.is_archive()
+                    && let Err(error) = &siblings
+                {
+                    return Err(error.clone());
+                }
+                let clicked = prefetch.load_source(&path, cancelled)?;
                 let mut media = Vec::new();
                 for target in &targets {
                     if target == &path {
                         media.push(clicked.clone());
                     } else {
-                        if !prefetch.promote_if_current(target, foreground) {
+                        if !prefetch.promote_source_if_current(target, foreground) {
                             return Err("Image preparation cancelled.".into());
                         }
-                        media.push(prefetch.load(target, cancelled)?);
+                        media.push(prefetch.load_source(target, cancelled)?);
                     }
                 }
                 if mode == ReadingMode::Book {
@@ -1022,17 +1041,17 @@ struct ThumbTexture {
 
 #[derive(Default)]
 struct ThumbTextures {
-    map: HashMap<PathBuf, ThumbTexture>,
+    map: HashMap<SourceRef, ThumbTexture>,
 }
 
 impl ThumbTextures {
-    fn retain(&mut self, keep: &[PathBuf]) {
+    fn retain(&mut self, keep: &[SourceRef]) {
         self.map.retain(|path, _| keep.contains(path));
     }
 
     /// The service returns a thumbnail-sized Arc; a missing current-epoch value
     /// removes the old texture so a stale picture is never shown.
-    fn update(&mut self, ctx: &egui::Context, path: &PathBuf, source: Option<Arc<RgbaImage>>) {
+    fn update(&mut self, ctx: &egui::Context, path: &SourceRef, source: Option<Arc<RgbaImage>>) {
         let Some(source) = source else {
             self.map.remove(path);
             return;
@@ -1060,7 +1079,7 @@ impl ThumbTextures {
         );
     }
 
-    fn texture(&self, path: &PathBuf) -> Option<&TextureHandle> {
+    fn texture(&self, path: &SourceRef) -> Option<&TextureHandle> {
         self.map.get(path).map(|texture| &texture.image)
     }
 
@@ -1077,12 +1096,12 @@ struct Oxeye {
     worker_tx: Sender<Completion>,
     worker_rx: Receiver<Completion>,
     navigation: NavigationFlow,
-    navigation_paths: Vec<PathBuf>,
+    navigation_paths: Vec<SourceRef>,
     nav: Option<NavigationPaint>,
-    selected: Option<PathBuf>,
-    displayed: Option<PathBuf>,
-    current_file: Option<PathBuf>,
-    siblings: Vec<PathBuf>,
+    selected: Option<SourceRef>,
+    displayed: Option<SourceRef>,
+    current_file: Option<SourceRef>,
+    siblings: Vec<SourceRef>,
     media: Option<Arc<model::LoadedMedia>>,
     tiled: Option<Arc<TiledFrame>>,
     other_pages: Vec<PreparedPage>,
@@ -1115,8 +1134,8 @@ struct Oxeye {
     language: Language,
     thumbnails: Thumbnails,
     thumb_generation: u64,
-    thumb_requests: Vec<PathBuf>,
-    thumb_visible: Vec<PathBuf>,
+    thumb_requests: Vec<SourceRef>,
+    thumb_visible: Vec<SourceRef>,
     thumb_textures: ThumbTextures,
     thumb_offset: f32,
     thumb_width: f32,
@@ -1133,13 +1152,21 @@ impl Oxeye {
     fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         install_style(&cc.egui_ctx);
         let loaded = settings::load_settings();
-        let display_mode = loaded.settings.reading_mode;
-        let language = resolve_language(loaded.settings.language);
-        let prefetch = Prefetcher::new(loaded.settings.prefetch.clone());
+        Self::from_settings(initial, loaded.settings, loaded.warning)
+    }
+
+    fn from_settings(
+        initial: Option<PathBuf>,
+        settings: AppSettings,
+        warning: Option<String>,
+    ) -> Self {
+        let display_mode = settings.reading_mode;
+        let language = resolve_language(settings.language);
+        let prefetch = Prefetcher::new(settings.prefetch.clone());
         prefetch.set_purpose(DecodePurpose::Animated);
         let thumbnails = Thumbnails::new(prefetch.clone());
         let mut feedback = Feedback::default();
-        if let Some(warning) = loaded.warning {
+        if let Some(warning) = warning {
             feedback.replace(
                 FeedbackKind::Error,
                 ui_text::catalog(language).settings_warning(&warning),
@@ -1149,7 +1176,7 @@ impl Oxeye {
         let (save_tx, save_rx) = mpsc::channel();
         Self {
             initial,
-            settings: loaded.settings,
+            settings,
             prefetch,
             loader: Loader::default(),
             worker_tx,
@@ -1371,7 +1398,7 @@ impl Oxeye {
         let target = mode_target(&self.current_file, &self.selected, &self.displayed);
         if let Some(path) = &target
             && !self.siblings.is_empty()
-            && selected_index(Some(path), &self.siblings).is_none()
+            && source_index(Some(path), &self.siblings).is_none()
         {
             return;
         }
@@ -1522,7 +1549,7 @@ impl Oxeye {
                 self.thumb_generation += 1;
                 self.thumb_requests.clear();
                 self.thumbnails
-                    .set_visible(Vec::new(), self.thumb_generation);
+                    .set_visible_sources(Vec::new(), self.thumb_generation);
             }
             return;
         }
@@ -1537,7 +1564,7 @@ impl Oxeye {
             self.thumb_revision = self.thumbnails.revision();
             self.thumb_stable = 0;
             self.thumbnails
-                .set_visible(self.thumb_requests.clone(), self.thumb_generation);
+                .set_visible_sources(self.thumb_requests.clone(), self.thumb_generation);
             self.wake_thumbnails(ctx);
         }
         let allowed = self.background_allowed();
@@ -1553,7 +1580,7 @@ impl Oxeye {
         self.thumb_visible = self.siblings[range].to_vec();
         self.thumb_textures.retain(&self.thumb_requests);
         for path in self.thumb_requests.clone() {
-            let source = self.thumbnails.get(&path);
+            let source = self.thumbnails.get_source(&path);
             self.thumb_textures.update(ctx, &path, source);
         }
     }
@@ -1604,7 +1631,7 @@ impl Oxeye {
         if self.navigation.is_idle() {
             self.navigation_paths = self.siblings.clone();
         }
-        let Some(base) = selected_index(self.selected.as_deref(), &self.navigation_paths) else {
+        let Some(base) = source_index(self.selected.as_ref(), &self.navigation_paths) else {
             return;
         };
         if self.navigation.enqueue(
@@ -1661,7 +1688,7 @@ impl Oxeye {
     }
 
     fn update_prefetch_context(&self) {
-        self.prefetch.update_context_many(
+        self.prefetch.update_context_many_sources(
             self.siblings.clone(),
             self.selected.clone(),
             self.displayed_media(),
@@ -1676,10 +1703,10 @@ impl Oxeye {
             .collect()
     }
 
-    fn displayed_paths(&self) -> Vec<PathBuf> {
+    fn displayed_paths(&self) -> Vec<SourceRef> {
         self.displayed_media()
             .iter()
-            .map(|media| media.path.clone())
+            .map(|media| media.source.clone())
             .collect()
     }
 
@@ -1755,22 +1782,79 @@ impl Oxeye {
         }
     }
 
-    fn load(&mut self, ctx: &egui::Context, path: PathBuf, queued: bool) {
+    fn open_path(&mut self, path: PathBuf, ctx: &egui::Context) {
         if self.close_state.requested {
+            return;
+        }
+        self.cancel_navigation();
+        self.loader.cancel();
+        self.candidate = None;
+        self.loading_file = false;
+        self.pause_animation();
+        self.prefetch.set_allowed(false);
+        self.thumb_offset = 0.;
+        let result = catalog_for(&path)
+            .and_then(|catalog| {
+                let file = SourceRef::file(&path);
+                let selected = catalog
+                    .items
+                    .iter()
+                    .find(|source| **source == file)
+                    .or_else(|| catalog.items.first())
+                    .cloned()
+                    .ok_or_else(|| self.text().no_images.to_owned())?;
+                Ok((selected, catalog.items))
+            })
+            .or_else(|error| {
+                if model::supported_path(&path) {
+                    let selected = SourceRef::file(&path);
+                    Ok((selected.clone(), vec![selected]))
+                } else {
+                    Err(error)
+                }
+            });
+        match result {
+            Ok((selected, siblings)) => {
+                self.siblings = siblings;
+                self.load(ctx, selected, false);
+            }
+            Err(error) => {
+                self.siblings.clear();
+                self.selected = None;
+                self.current_file = None;
+                self.error = Some(self.text().open_failed(&path.display().to_string(), &error));
+                self.sync_prefetch(ctx);
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    fn reject_changed_archive(&mut self, source: &SourceRef, ctx: &egui::Context) -> bool {
+        if !source.is_archive() || source_identity(source).is_some() {
+            return false;
+        }
+        self.cancel_navigation();
+        self.loader.cancel();
+        self.candidate = None;
+        self.loading_file = false;
+        self.pause_animation();
+        self.error = Some(
+            self.text()
+                .open_failed(&source_label(source), self.text().archive_changed),
+        );
+        self.sync_prefetch(ctx);
+        ctx.request_repaint();
+        true
+    }
+
+    fn load(&mut self, ctx: &egui::Context, path: SourceRef, queued: bool) {
+        if self.close_state.requested || self.reject_changed_archive(&path, ctx) {
             return;
         }
         if !queued {
             self.cancel_navigation();
         }
-        let path = match std::path::absolute(path) {
-            Ok(path) => path,
-            Err(error) => {
-                self.error = Some(self.text().path_failed_detail(&error.to_string()));
-                ctx.request_repaint();
-                return;
-            }
-        };
-        let foreground = self.prefetch.foreground_requested(&path);
+        let foreground = self.prefetch.foreground_requested_source(&path);
         self.prefetch.set_allowed(false);
         self.rotation.cancel();
         // Keep the old clocks paused, not dropped: a failed load must remain recoverable.
@@ -1870,6 +1954,9 @@ impl Oxeye {
                         self.error = Some(error);
                         self.navigation.failed(done.revision);
                         self.nav = None;
+                        if let Some(selected) = self.selected.clone() {
+                            self.reject_changed_archive(&selected, ctx);
+                        }
                     }
                 }
                 self.start_work(ctx);
@@ -1932,7 +2019,7 @@ impl Oxeye {
             .collect();
         self.loading_file = false;
         if prepared.loaded {
-            let path = prepared.media.path.clone();
+            let path = prepared.media.source.clone();
             self.selected = Some(path.clone());
             self.displayed = Some(path);
             self.error = None;
@@ -2153,9 +2240,15 @@ impl Oxeye {
         self.cancel_navigation();
         if let Some(path) = rfd::FileDialog::new()
             .set_title(self.text().open_picker_title)
+            .add_filter(
+                self.text().open_picker_title,
+                &[
+                    "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "cbz", "zip",
+                ],
+            )
             .pick_file()
         {
-            self.load(ctx, path, false);
+            self.open_path(path, ctx);
         }
         ctx.request_repaint();
     }
@@ -2439,10 +2532,10 @@ impl Oxeye {
     }
 
     fn position(&self) -> Option<usize> {
-        selected_index(self.selected.as_deref(), &self.siblings)
+        source_index(self.selected.as_ref(), &self.siblings)
     }
 
-    fn neighbor(&self, next: bool) -> Option<PathBuf> {
+    fn neighbor(&self, next: bool) -> Option<SourceRef> {
         let index = self.position()?;
         let index = if self.settings.reading_mode == ReadingMode::Single {
             adjacent_index(index, self.siblings.len(), next)?
@@ -2462,20 +2555,12 @@ impl Oxeye {
     }
 
     fn display_name(&self) -> String {
-        let names: Vec<_> = self
-            .displayed_paths()
-            .iter()
-            .filter_map(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .collect();
+        let names: Vec<_> = self.displayed_paths().iter().map(source_label).collect();
         let text = self.text();
         if names.is_empty() {
             self.selected
                 .as_ref()
-                .and_then(|path| path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
+                .map(source_label)
                 .unwrap_or_else(|| text.image_viewer.into())
         } else {
             text.image_names(&names)
@@ -2508,14 +2593,9 @@ impl Oxeye {
     }
 
     fn status_text(&self) -> String {
-        let name = self
-            .selected
-            .as_ref()
-            .and_then(|path| path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let name = self.selected.as_ref().map(source_label).unwrap_or_default();
         let text = self.text();
-        if self.selected != self.displayed && !self.busy() {
+        if self.selected.is_some() && self.selected != self.displayed && !self.busy() {
             return text.could_not_open(&name, self.tiled.is_some());
         }
         if self.tiled.is_none() {
@@ -2698,10 +2778,10 @@ impl Oxeye {
                             palette.muted,
                         );
                     }
-                    painter.text(
+                    painter.with_clip_rect(cell.intersect(rect)).text(
                         Pos2::new(cell.center().x, cell.bottom() - 10.),
                         Align2::CENTER_CENTER,
-                        (index + 1).to_string(),
+                        path.display_name(),
                         FontId::proportional(10.),
                         if active {
                             palette.accent
@@ -3573,8 +3653,7 @@ impl Oxeye {
         let message = if self.loading_file {
             self.selected
                 .as_ref()
-                .and_then(|path| path.file_name())
-                .map(|name| text.opening_file(&name.to_string_lossy()))
+                .map(|source| text.opening_file(&source_label(source)))
                 .unwrap_or_else(|| text.opening_image.to_owned())
         } else if rotating {
             text.rotating.to_owned()
@@ -3611,7 +3690,7 @@ impl eframe::App for Oxeye {
             self.handle_settings_keys(ctx);
         }
         if let Some(path) = self.initial.take() {
-            self.load(ctx, path, false);
+            self.open_path(path, ctx);
         }
         if self.settings_draft.is_none() {
             let dropped = ctx.input(|input| {
@@ -3622,7 +3701,7 @@ impl eframe::App for Oxeye {
                     .map(|dropped| dropped.path().to_path_buf())
             });
             if let Some(path) = dropped {
-                self.load(ctx, path, false);
+                self.open_path(path, ctx);
             }
         }
         self.poll_workers(ctx);
@@ -3685,7 +3764,11 @@ mod tests {
     }
 
     fn requested_work(path: PathBuf, prefetch: &Prefetcher, mode: ReadingMode) -> Work {
-        let foreground = prefetch.foreground_requested(&path);
+        requested_source_work(SourceRef::file(&path), prefetch, mode)
+    }
+
+    fn requested_source_work(path: SourceRef, prefetch: &Prefetcher, mode: ReadingMode) -> Work {
+        let foreground = prefetch.foreground_requested_source(&path);
         Work::Load(
             path,
             prefetch.clone(),
@@ -3710,6 +3793,471 @@ mod tests {
             };
             encoder.write_frame(&frame).unwrap();
         }
+    }
+
+    fn test_app() -> Oxeye {
+        Oxeye::from_settings(
+            None,
+            AppSettings {
+                language: Language::English,
+                prefetch: PrefetchSettings {
+                    before: 0,
+                    after: 2,
+                    memory_mib: 8,
+                },
+                ..Default::default()
+            },
+            None,
+        )
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "background UI work timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn finish_load(app: &mut Oxeye, ctx: &egui::Context) {
+        wait_until(|| {
+            app.poll_workers(ctx);
+            !app.loader.running && app.loader.pending.is_none()
+        });
+        if app.candidate.is_some() {
+            app.commit_candidate(ctx);
+        }
+        if let Some(nav) = app.nav.take() {
+            assert!(app.navigation.crossed_frame(nav.ticket));
+        }
+        app.sync_prefetch(ctx);
+    }
+
+    fn png_bytes(color: u8) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        RgbaImage::from_pixel(2, 3, image::Rgba([color, 20, 30, 255]))
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    fn write_comic(path: &Path) {
+        let first = png_bytes(1);
+        let second = png_bytes(2);
+        let tenth = png_bytes(10);
+        model::source::test_support::write_zip(
+            path,
+            &[
+                ("chapter/page10.png", &tenth),
+                ("chapter/page2.png", &second),
+                ("chapter/page1.png", &first),
+                ("readme.txt", b"not a page"),
+            ],
+        );
+    }
+
+    #[test]
+    fn archives_open_navigate_pair_preview_preload_and_copy_entry_pixels() {
+        let directory = tempfile::tempdir().unwrap();
+        for extension in ["cbz", "zip"] {
+            let archive = directory.path().join(format!("comic.{extension}"));
+            write_comic(&archive);
+            let ctx = egui::Context::default();
+            let mut app = test_app();
+            app.thumb_width = 3. * CELL_WIDTH;
+            app.open_path(archive.clone(), &ctx);
+            let sources = app.siblings.clone();
+            assert_eq!(
+                sources
+                    .iter()
+                    .map(SourceRef::display_name)
+                    .collect::<Vec<_>>(),
+                ["page1.png", "page2.png", "page10.png"]
+            );
+            assert!(
+                sources
+                    .iter()
+                    .all(|source| source.archive_root() == Some(archive.as_path()))
+            );
+            finish_load(&mut app, &ctx);
+            assert_eq!(app.selected, Some(sources[0].clone()));
+            assert_eq!(app.displayed_paths(), vec![sources[0].clone()]);
+            assert_eq!(app.position_label(), "1 / 3");
+            assert_eq!(app.display_name(), format!("comic.{extension} / page1.png"));
+            assert!(app.error.is_none());
+
+            wait_until(|| {
+                sources[1..].iter().all(|source| {
+                    app.prefetch
+                        .peek_source(source, &AtomicBool::new(false))
+                        .is_some()
+                })
+            });
+            let cached = app
+                .prefetch
+                .peek_source(&sources[1], &AtomicBool::new(false))
+                .unwrap();
+            assert_eq!(cached.source, sources[1]);
+            assert_eq!(cached.frames[0].pixels.get_pixel(0, 0).0[0], 2);
+            assert!(
+                app.prefetch
+                    .peek_source(&SourceRef::file(&archive), &AtomicBool::new(false))
+                    .is_none()
+            );
+            wait_until(|| {
+                sources
+                    .iter()
+                    .all(|source| app.thumbnails.get_source(source).is_some())
+            });
+            app.sync_thumbnails(&ctx);
+            assert_eq!(app.thumb_requests, sources);
+            assert_eq!(app.thumb_textures.map.len(), 3);
+            for (source, color) in sources.iter().zip([1, 2, 10]) {
+                assert_eq!(
+                    app.thumb_textures.map[source].source.get_pixel(0, 0).0[0],
+                    color
+                );
+            }
+
+            let action = key_action(Key::PageDown, Modifiers::NONE).unwrap();
+            app.perform(action, Rect::NOTHING, &ctx);
+            finish_load(&mut app, &ctx);
+            assert_eq!(app.selected, Some(sources[1].clone()));
+            assert_eq!(app.position_label(), "2 / 3");
+            assert_eq!(app.neighbor(false), Some(sources[0].clone()));
+            assert_eq!(app.neighbor(true), Some(sources[2].clone()));
+            assert!(
+                Arc::ptr_eq(app.media.as_ref().unwrap(), &cached),
+                "foreground uses the entry cache key"
+            );
+
+            assert!(app.transition_to_mode(ReadingMode::Book, &ctx));
+            finish_load(&mut app, &ctx);
+            assert_eq!(app.displayed_paths(), sources[1..]);
+            assert_eq!(app.position_label(), "2–3 / 3");
+            app.copy_current_view(&ctx);
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+            let copied = output
+                .platform_output
+                .commands
+                .iter()
+                .find_map(|command| {
+                    if let egui::OutputCommand::CopyImage(image) = command {
+                        Some(image)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert_eq!(copied.size, [4 + viewer::BOOK_GAP as usize, 3]);
+            assert_eq!(copied.pixels[0], Color32::from_rgb(10, 20, 30));
+            assert_eq!(
+                copied.pixels[2 + viewer::BOOK_GAP as usize],
+                Color32::from_rgb(2, 20, 30)
+            );
+            output.textures_delta.clear();
+
+            app.edge(false, &ctx);
+            finish_load(&mut app, &ctx);
+            assert_eq!(
+                app.displayed_paths(),
+                vec![sources[0].clone()],
+                "Book cover is single"
+            );
+            app.edge(true, &ctx);
+            finish_load(&mut app, &ctx);
+            assert_eq!(app.displayed_paths(), sources[1..]);
+        }
+    }
+
+    #[test]
+    fn folder_open_keeps_selected_file_siblings_previews_and_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("1.png");
+        let second = directory.path().join("2.png");
+        std::fs::write(&first, png_bytes(1)).unwrap();
+        std::fs::write(&second, png_bytes(2)).unwrap();
+        write_comic(&directory.path().join("comic.cbz"));
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.thumb_width = 2. * CELL_WIDTH;
+        app.open_path(second.clone(), &ctx);
+        finish_load(&mut app, &ctx);
+        assert_eq!(
+            app.siblings,
+            vec![SourceRef::file(&first), SourceRef::file(&second)]
+        );
+        assert_eq!(app.selected, Some(SourceRef::file(&second)));
+        assert_eq!(app.display_name(), "2.png");
+        assert_eq!(app.position_label(), "2 / 2");
+        wait_until(|| {
+            app.thumbnails
+                .get_source(&SourceRef::file(&second))
+                .is_some()
+        });
+        app.copy_current_view(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyImage(image) if image.size == [2, 3] && image.pixels[0] == Color32::from_rgb(2, 20, 30))
+        }));
+        output.textures_delta.clear();
+        app.perform(Action::Previous, Rect::NOTHING, &ctx);
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.selected, Some(SourceRef::file(&first)));
+    }
+
+    #[test]
+    fn explicit_open_reserves_prefetched_file_and_archive_page_before_context_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("1.png");
+        let second = directory.path().join("2.png");
+        std::fs::write(&first, png_bytes(1)).unwrap();
+        std::fs::write(&second, png_bytes(2)).unwrap();
+        let archive = directory.path().join("comic.cbz");
+        write_comic(&archive);
+        for archive_mode in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = test_app();
+            app.settings.prefetch.before = 2;
+            app.prefetch.configure(app.settings.prefetch.clone());
+            app.open_path(
+                if archive_mode {
+                    archive.clone()
+                } else {
+                    first.clone()
+                },
+                &ctx,
+            );
+            finish_load(&mut app, &ctx);
+            let target = if archive_mode {
+                let first_page = app.siblings[0].clone();
+                app.load(&ctx, app.siblings[1].clone(), false);
+                finish_load(&mut app, &ctx);
+                first_page
+            } else {
+                SourceRef::file(&second)
+            };
+            let mut cached = None;
+            wait_until(|| {
+                cached = app.prefetch.peek_source(&target, &AtomicBool::new(false));
+                cached.is_some()
+            });
+            app.open_path(
+                if archive_mode {
+                    archive.clone()
+                } else {
+                    second.clone()
+                },
+                &ctx,
+            );
+            finish_load(&mut app, &ctx);
+            assert_eq!(app.displayed, Some(target));
+            assert!(Arc::ptr_eq(
+                app.media.as_ref().unwrap(),
+                cached.as_ref().unwrap()
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readable_file_opens_when_its_directory_cannot_be_listed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("image.png");
+        std::fs::write(&file, png_bytes(42)).unwrap();
+        let permissions = std::fs::metadata(directory.path()).unwrap().permissions();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o111)).unwrap();
+        if model::sibling_images(&file).is_ok() {
+            std::fs::set_permissions(directory.path(), permissions).unwrap();
+            eprintln!("skipping unlistable-directory test: process bypasses directory permissions");
+            return;
+        }
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.open_path(file.clone(), &ctx);
+        finish_load(&mut app, &ctx);
+        std::fs::set_permissions(directory.path(), permissions).unwrap();
+        assert_eq!(app.selected, Some(SourceRef::file(&file)));
+        assert_eq!(app.siblings, vec![SourceRef::file(&file)]);
+        assert_eq!(
+            app.media.as_ref().unwrap().frames[0]
+                .pixels
+                .get_pixel(0, 0)
+                .0[0],
+            42
+        );
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn replaced_archive_cancels_queued_navigation_before_load_and_after_worker_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        for worker_started in [false, true] {
+            write_comic(&archive);
+            let ctx = egui::Context::default();
+            let mut app = test_app();
+            app.open_path(archive.clone(), &ctx);
+            finish_load(&mut app, &ctx);
+            let previous = app.media.clone().unwrap();
+            let sources = app.siblings.clone();
+            app.navigation_paths = sources.clone();
+            assert!(
+                app.navigation
+                    .enqueue(Navigation::Next, 0, 3, ReadingMode::Single)
+            );
+            assert!(
+                app.navigation
+                    .enqueue(Navigation::Next, 0, 3, ReadingMode::Single)
+            );
+            let work = if worker_started {
+                let ticket = app.navigation.start_next(app.loader.revision + 1).unwrap();
+                assert_eq!(ticket.index, 1);
+                app.selected = Some(sources[1].clone());
+                app.loading_file = true;
+                app.loader.request(requested_source_work(
+                    sources[1].clone(),
+                    &app.prefetch,
+                    ReadingMode::Single,
+                ));
+                Some(app.loader.take().unwrap())
+            } else {
+                None
+            };
+            let changed = png_bytes(88);
+            model::source::test_support::write_zip(
+                &archive,
+                &[
+                    ("chapter/page1.png", &changed),
+                    ("extra.txt", b"replacement archive"),
+                ],
+            );
+            assert!(source_identity(&sources[1]).is_none());
+            if let Some((revision, work, cancelled)) = work {
+                let result = prepare(work, &cancelled);
+                assert!(result.image.is_err());
+                app.worker_tx.send(Completion { revision, result }).unwrap();
+                app.poll_workers(&ctx);
+            } else {
+                app.start_navigation(&ctx);
+            }
+            assert!(app.navigation.is_idle());
+            assert!(app.navigation_paths.is_empty());
+            assert!(app.loader.pending.is_none());
+            assert!(!app.loading_file);
+            assert!(
+                app.error
+                    .as_ref()
+                    .unwrap()
+                    .contains(app.text().archive_changed)
+            );
+            assert!(Arc::ptr_eq(app.media.as_ref().unwrap(), &previous));
+        }
+    }
+
+    #[test]
+    fn archive_errors_are_localized_and_keep_last_image_without_old_siblings() {
+        let directory = tempfile::tempdir().unwrap();
+        let good = directory.path().join("good.cbz");
+        write_comic(&good);
+        let corrupt = directory.path().join("corrupt.zip");
+        std::fs::write(&corrupt, b"not a ZIP").unwrap();
+        let empty = directory.path().join("empty.cbz");
+        model::source::test_support::write_zip(&empty, &[]);
+        let text_only = directory.path().join("text.zip");
+        model::source::test_support::write_zip(&text_only, &[("nested/readme.txt", b"text")]);
+        for language in [
+            Language::English,
+            Language::SimplifiedChinese,
+            Language::Japanese,
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = test_app();
+            app.language = language;
+            app.open_path(good.clone(), &ctx);
+            finish_load(&mut app, &ctx);
+            let previous = app.media.clone().unwrap();
+            for path in [&corrupt, &empty, &text_only] {
+                app.open_path(path.clone(), &ctx);
+                assert!(
+                    app.error.as_ref().unwrap().contains(
+                        &app.text()
+                            .could_not_open(&path.display().to_string(), false)
+                    )
+                );
+                if path != &corrupt {
+                    assert!(app.error.as_ref().unwrap().contains(app.text().no_images));
+                }
+                assert!(Arc::ptr_eq(app.media.as_ref().unwrap(), &previous));
+                assert!(app.siblings.is_empty());
+                assert!(app.navigation_paths.is_empty());
+                assert!(app.selected.is_none());
+                assert!(app.neighbor(true).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_archive_and_file_opens_supersede_queued_old_contexts() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.cbz");
+        let second = directory.path().join("second.zip");
+        write_comic(&first);
+        write_comic(&second);
+        let folder = directory.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let file = folder.join("only.png");
+        std::fs::write(&file, png_bytes(99)).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.thumb_width = 3. * CELL_WIDTH;
+        app.open_path(first.clone(), &ctx);
+        finish_load(&mut app, &ctx);
+        wait_until(|| {
+            app.siblings
+                .iter()
+                .all(|source| app.thumbnails.get_source(source).is_some())
+        });
+        app.sync_thumbnails(&ctx);
+        let old_sources = app.siblings.clone();
+        for target in [&second, &file] {
+            app.enqueue_navigation(Navigation::Next, &ctx);
+            app.enqueue_navigation(Navigation::Next, &ctx);
+            assert!(!app.navigation.is_idle());
+            app.open_path(target.clone(), &ctx);
+            assert!(app.navigation.is_idle());
+            assert!(app.navigation_paths.is_empty());
+            let expected = catalog_for(target).unwrap().items;
+            assert_eq!(app.siblings, expected);
+            finish_load(&mut app, &ctx);
+            assert_eq!(app.siblings, expected);
+            assert_eq!(app.selected, expected.first().cloned());
+            assert!(
+                app.thumb_textures
+                    .map
+                    .keys()
+                    .all(|source| expected.contains(source))
+            );
+            assert!(
+                old_sources
+                    .iter()
+                    .all(|source| !app.thumb_textures.map.contains_key(source))
+            );
+            assert!(
+                app.displayed_paths()
+                    .iter()
+                    .all(|source| expected.contains(source))
+            );
+        }
+        assert_eq!(
+            app.media.as_ref().unwrap().frames[0]
+                .pixels
+                .get_pixel(0, 0)
+                .0[0],
+            99
+        );
     }
 
     #[test]
@@ -3870,8 +4418,11 @@ mod tests {
         let result = prepare(load_work(corrupt.clone()), &AtomicBool::new(false));
         assert!(result.image.is_err());
         let (selected, siblings) = result.selection.unwrap();
-        assert_eq!(selected, corrupt);
-        assert_eq!(siblings.unwrap(), vec![corrupt, other]);
+        assert_eq!(selected, SourceRef::file(&corrupt));
+        assert_eq!(
+            siblings.unwrap(),
+            vec![SourceRef::file(&corrupt), SourceRef::file(&other)]
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3886,7 +4437,9 @@ mod tests {
         assert!(loader.take().is_none());
         assert!(!loader.finish(first));
         let (latest, work, _) = loader.take().unwrap();
-        assert!(matches!(work, Work::Load(path, _, _, _, _, _) if path == Path::new("third.png")));
+        assert!(
+            matches!(work, Work::Load(path, _, _, _, _, _) if path == SourceRef::file(Path::new("third.png")))
+        );
         assert!(loader.finish(latest));
         assert!(loader.take().is_none());
     }
@@ -3911,17 +4464,22 @@ mod tests {
             ..Default::default()
         });
         let mut loader = Loader::default();
-        let mut displayed = paths[0].clone();
+        let sources: Vec<_> = paths.iter().map(|path| SourceRef::file(path)).collect();
+        let mut displayed = sources[0].clone();
         let mut committed = Vec::new();
         let mut failed = Vec::new();
         for (index, path) in paths.iter().enumerate().skip(1) {
             let ticket = navigation.start_next(loader.revision + 1).unwrap();
             assert_eq!(ticket.index, index);
-            let foreground = prefetch.foreground_requested(path);
+            let foreground = prefetch.foreground_requested_source(&sources[index]);
             prefetch.set_allowed(false);
-            prefetch.update_context(paths.clone(), Some(path.clone()), None);
+            prefetch.update_context_many_sources(
+                sources.clone(),
+                Some(sources[index].clone()),
+                Vec::new(),
+            );
             loader.request(Work::Load(
-                path.clone(),
+                sources[index].clone(),
                 prefetch.clone(),
                 foreground,
                 MAX_TILE,
@@ -3932,23 +4490,23 @@ mod tests {
             let result = prepare(work, &cancelled);
             assert!(loader.finish(revision));
             let (selected, siblings) = result.selection.unwrap();
-            assert_eq!(&selected, path);
-            assert!(!siblings.unwrap().contains(&paths[2]));
+            assert_eq!(selected, SourceRef::file(path));
+            assert!(!siblings.unwrap().contains(&sources[2]));
             assert!(navigation.start_next(revision + 1).is_none());
             match result.image {
                 Ok(prepared) => {
-                    assert_eq!(&prepared.media.path, path);
+                    assert_eq!(prepared.media.source, sources[index]);
                     assert!(!prepared.tiled.tiles.is_empty());
                     assert!(!navigation.crossed_frame(ticket));
                     // Supply the two UI events explicitly; this test does not run a window.
                     assert_eq!(navigation.painted(revision), Some(ticket));
-                    displayed = prepared.media.path.clone();
+                    displayed = prepared.media.source.clone();
                     committed.push(index);
                     assert!(navigation.start_next(revision + 1).is_none());
                     assert!(navigation.crossed_frame(ticket));
                 }
                 Err(_) => {
-                    assert_eq!(displayed, paths[0]);
+                    assert_eq!(displayed, sources[0]);
                     failed.push(index);
                     assert!(navigation.failed(revision));
                 }
@@ -3956,7 +4514,7 @@ mod tests {
         }
         assert_eq!(failed, vec![1, 2]);
         assert_eq!(committed, vec![3, 4]);
-        assert_eq!(displayed, paths[4]);
+        assert_eq!(displayed, sources[4]);
         assert!(navigation.is_idle());
         assert!(loader.take().is_none());
         prefetch.shutdown();
@@ -4278,7 +4836,9 @@ mod tests {
     #[test]
     fn explicit_jump_discards_queued_navigation_targets() {
         let mut flow = NavigationFlow::default();
-        let mut paths: Vec<PathBuf> = ["0.png", "1.png", "2.png"].map(PathBuf::from).into();
+        let mut paths: Vec<SourceRef> = ["0.png", "1.png", "2.png"]
+            .map(|path| SourceRef::file(Path::new(path)))
+            .into();
         assert!(flow.enqueue(Navigation::Next, 0, paths.len(), ReadingMode::Single));
         assert!(flow.enqueue(Navigation::Next, 0, paths.len(), ReadingMode::Single));
         assert!(!flow.is_idle());
@@ -4305,7 +4865,7 @@ mod tests {
     #[test]
     fn thumbnail_textures_retire_on_missing_source_and_hidden_strip() {
         let ctx = egui::Context::default();
-        let path = PathBuf::from("a.png");
+        let path = SourceRef::file(Path::new("a.png"));
         let source = Arc::new(RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255])));
         let mut textures = ThumbTextures::default();
         textures.update(&ctx, &path, Some(source.clone()));
@@ -4335,7 +4895,6 @@ mod tests {
     fn media(pixels: Arc<RgbaImage>) -> Arc<model::LoadedMedia> {
         Arc::new(model::LoadedMedia {
             source: model::source::SourceRef::file(Path::new("fixture.png")),
-            path: "fixture.png".into(),
             frames: vec![model::MediaFrame {
                 pixels,
                 delay: Duration::ZERO,
@@ -4351,7 +4910,6 @@ mod tests {
     ) -> Arc<model::LoadedMedia> {
         Arc::new(model::LoadedMedia {
             source: model::source::SourceRef::file(Path::new("animation.gif")),
-            path: "animation.gif".into(),
             frames: frames
                 .into_iter()
                 .zip(delays)
@@ -4406,7 +4964,6 @@ mod tests {
     fn stale_playback_frame_is_replaced_with_requested_rotation() {
         let media = Arc::new(model::LoadedMedia {
             source: model::source::SourceRef::file(Path::new("clock.gif")),
-            path: "clock.gif".into(),
             loop_mode: model::LoopMode::Infinite,
             frames: (0..3)
                 .map(|_| model::MediaFrame {
@@ -4457,7 +5014,6 @@ mod tests {
             .collect();
         let media = Arc::new(model::LoadedMedia {
             source: model::source::SourceRef::file(Path::new("animation.gif")),
-            path: "animation.gif".into(),
             frames,
             loop_mode: model::LoopMode::Finite(2),
         });
@@ -4560,8 +5116,8 @@ mod tests {
         std::os::unix::fs::symlink(&target, &selected).unwrap();
         let result = prepare(load_work(selected.clone()), &AtomicBool::new(false));
         let (path, siblings) = result.selection.unwrap();
-        assert_eq!(path, selected);
-        assert_eq!(siblings.unwrap(), vec![selected]);
+        assert_eq!(path, SourceRef::file(&selected));
+        assert_eq!(siblings.unwrap(), vec![SourceRef::file(&selected)]);
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
@@ -4701,7 +5257,7 @@ mod tests {
             &AtomicBool::new(false),
         );
         assert!(failed.image.is_err());
-        assert_eq!(failed.selection.unwrap().0, paths[1]);
+        assert_eq!(failed.selection.unwrap().0, SourceRef::file(&paths[1]));
         assert_eq!(good.others.len(), 1, "old spread remains intact");
         prefetch.shutdown();
     }
@@ -4815,7 +5371,9 @@ mod tests {
         assert!(!action_allows_repeat(Action::ToggleMode));
         assert!(action_allows_repeat(Action::Next));
         let mut flow = NavigationFlow::default();
-        let mut paths: Vec<PathBuf> = ["0.png", "1.png", "2.png"].map(PathBuf::from).into();
+        let mut paths: Vec<SourceRef> = ["0.png", "1.png", "2.png"]
+            .map(|path| SourceRef::file(Path::new(path)))
+            .into();
         assert!(flow.enqueue(Navigation::Next, 0, paths.len(), ReadingMode::Book));
         reset_navigation(&mut flow, &mut paths);
         assert!(flow.is_idle() && paths.is_empty());
@@ -4828,11 +5386,11 @@ mod tests {
         assert!(queue.request(1, settings.clone()));
         assert_eq!(queue.next().unwrap(), (1, settings));
 
-        let clicked = Some(PathBuf::from("2.png"));
-        let anchor = Some(PathBuf::from("1.png"));
+        let clicked = Some(SourceRef::file(Path::new("2.png")));
+        let anchor = Some(SourceRef::file(Path::new("1.png")));
         assert_eq!(
             mode_target(&clicked, &anchor, &None),
-            Some(PathBuf::from("2.png")),
+            clicked,
             "switching layouts keeps the clicked page, not the spread anchor"
         );
         assert_eq!(mode_target(&None, &anchor, &clicked), anchor);

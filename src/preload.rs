@@ -7,6 +7,7 @@
 //! cancellation, and the worker lifecycle.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -27,7 +28,7 @@ type DecodeFn = dyn Fn(&SourceRef, &AtomicBool, DecodePurpose) -> Result<Arc<Loa
 
 /// Guard for one foreground navigation transaction.
 ///
-/// A top-level [`Prefetcher::foreground_requested`] advances the generation and
+/// A top-level [`Prefetcher::foreground_requested_source`] advances the generation and
 /// returns this token. Partner-page promotion with a stale token is rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ForegroundToken(u64);
@@ -146,7 +147,7 @@ struct State {
     allowed: bool,
     inflight: Option<Inflight>,
     foreground: Option<ForegroundReservation>,
-    /// Latest path passed to [`Prefetcher::foreground_requested`].
+    /// Latest source passed to [`Prefetcher::foreground_requested_source`].
     foreground_target: Option<SourceRef>,
     /// Generation of the current top-level foreground transaction.
     foreground_generation: u64,
@@ -260,7 +261,8 @@ impl Prefetcher {
     /// is moved out of the cache into a one-slot foreground reservation so a
     /// subsequent `update_context` cannot prune it before `load` runs. A
     /// same-path in-flight decode is preserved and may also be promoted by
-    /// [`Self::load`]; a different in-flight decode is asked to stop.
+    /// [`Self::load_source`]; a different in-flight decode is asked to stop.
+    #[cfg(test)]
     pub fn foreground_requested(&self, path: &Path) -> ForegroundToken {
         self.foreground_requested_source(&SourceRef::file(path))
     }
@@ -282,6 +284,7 @@ impl Prefetcher {
     /// under one lock. A stale token returns `false` without mutating state, so
     /// an old Book worker cannot drop or cancel the new transaction's page.
     /// Valid partner promotion does not advance the generation.
+    #[cfg(test)]
     pub fn promote_if_current(&self, path: &Path, token: ForegroundToken) -> bool {
         self.promote_source_if_current(&SourceRef::file(path), token)
     }
@@ -305,6 +308,7 @@ impl Prefetcher {
     /// This blocks and must run on a background thread only. `cancel` is the
     /// caller's own cancellation flag; stale results still need to be rejected
     /// by the caller's revision check.
+    #[cfg(test)]
     pub fn load(&self, path: &Path, cancel: &AtomicBool) -> Result<Arc<LoadedMedia>, String> {
         self.load_source(&SourceRef::file(path), cancel)
     }
@@ -354,6 +358,7 @@ impl Prefetcher {
     /// them are excluded from cache accounting, and speculative prefetch is
     /// computed outside their file span. Pure coordination: no file I/O and no
     /// decoding happen on this call.
+    #[cfg(test)]
     pub fn update_context_many(
         &self,
         siblings: Vec<PathBuf>,
@@ -483,7 +488,7 @@ impl Prefetcher {
     /// reserving, recording a hit, or decoding; the caller must resize and drop
     /// it promptly. Returns `None` when the file is no longer fresh or was never
     /// recorded with an original identity.
-    #[allow(dead_code)] // Retained Path compatibility API.
+    #[cfg(test)]
     pub fn peek(&self, path: &Path, cancel: &AtomicBool) -> Option<Arc<LoadedMedia>> {
         self.peek_source(&SourceRef::file(path), cancel)
     }
@@ -1379,7 +1384,6 @@ mod tests {
     fn media(path: &Path, width: u32, height: u32, frames: usize) -> LoadedMedia {
         LoadedMedia {
             source: SourceRef::file(path),
-            path: absolute(path),
             frames: (0..frames)
                 .map(|_| MediaFrame {
                     pixels: Arc::new(RgbaImage::from_pixel(width, height, Rgba([1, 2, 3, 255]))),
@@ -1453,7 +1457,7 @@ mod tests {
                 entry
                     .media
                     .upgrade()
-                    .is_some_and(|media| media.path == absolute(path))
+                    .is_some_and(|media| media.source == SourceRef::file(path))
             })
     }
 
@@ -1534,7 +1538,9 @@ mod tests {
             .set_modified(old.modified + Duration::from_secs(5))
             .unwrap();
         assert!(prefetch.peek_source(&items[1], &cancel).is_none());
-        let fresh = prefetch.load_source(&items[1], &cancel).unwrap();
+        assert!(prefetch.load_source(&items[1], &cancel).is_err());
+        let refreshed = catalog_for(&path).unwrap().items;
+        let fresh = prefetch.load_source(&refreshed[1], &cancel).unwrap();
         assert!(!Arc::ptr_eq(&loaded, &fresh));
         assert_eq!(
             prefetch.stats().hits,
@@ -1725,7 +1731,7 @@ mod tests {
         let loaded = prefetcher
             .load(&b, &AtomicBool::new(false))
             .expect("ordinary load after deletion");
-        assert_eq!(loaded.path, absolute(&b));
+        assert_eq!(loaded.source, SourceRef::file(&b));
         assert_eq!(prefetcher.stats().entries, 0);
         assert_eq!(prefetcher.stats().hits, 0);
     }
@@ -1785,7 +1791,7 @@ mod tests {
         release_tx.send(()).unwrap();
         let loaded = joined.join().unwrap().expect("promoted load");
         assert_eq!(count.load(Ordering::Relaxed), 1);
-        assert_eq!(loaded.path, absolute(&b));
+        assert_eq!(loaded.source, SourceRef::file(&b));
         assert_eq!(prefetcher.stats().entries, 0);
         prefetcher.update_context(siblings, Some(b), Some(loaded));
         thread::sleep(Duration::from_millis(30));
@@ -1880,7 +1886,7 @@ mod tests {
         let loaded = prefetcher
             .load(&b, &AtomicBool::new(false))
             .expect("promoted completion reservation");
-        assert_eq!(loaded.path, absolute(&b));
+        assert_eq!(loaded.source, SourceRef::file(&b));
         assert_eq!(prefetcher.stats().entries, 0);
         assert_eq!(prefetcher.stats().hits, 1);
     }
@@ -2424,7 +2430,7 @@ mod tests {
         let loaded = prefetcher
             .load(&b, &AtomicBool::new(false))
             .expect("ordinary decode after cache loses read permission");
-        assert_eq!(loaded.path, absolute(&b));
+        assert_eq!(loaded.source, SourceRef::file(&b));
         assert_eq!(count.load(Ordering::Relaxed), 2);
         assert_eq!(prefetcher.stats().entries, 0);
         assert_eq!(prefetcher.stats().hits, 0);
@@ -2448,7 +2454,7 @@ mod tests {
         let loaded = prefetcher
             .load(&b, &AtomicBool::new(false))
             .expect("ordinary decode after reservation loses read permission");
-        assert_eq!(loaded.path, absolute(&b));
+        assert_eq!(loaded.source, SourceRef::file(&b));
         assert_eq!(count.load(Ordering::Relaxed), 2);
         assert_eq!(prefetcher.stats().hits, 0);
         assert!(lock(&prefetcher.inner.shared.state).foreground.is_none());

@@ -3,10 +3,13 @@
 use std::cmp::Ordering;
 use std::fmt;
 use std::fs::File;
-use std::io::{Cursor, Read, Seek, SeekFrom};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+#[cfg(test)]
 use image::{ImageDecoder, ImageReader, Limits};
 use zip::read::{ArchiveOffset, Config, OwnedZipFileEntry, ZipFileEntry};
 use zip::unstable::format::{blocks::Zip32CentralDirectoryEnd, magic::Magic};
@@ -30,6 +33,9 @@ pub enum SourceRef {
     File(PathBuf),
     Archive {
         archive: PathBuf,
+        archive_len: u64,
+        archive_mtime_secs: u64,
+        archive_mtime_nanos: u32,
         kind: ArchiveKind,
         index: usize,
         name: String,
@@ -97,9 +103,6 @@ impl fmt::Display for SourceRef {
 #[derive(Clone, Debug)]
 pub struct Catalog {
     pub items: Vec<SourceRef>,
-    /// Folder for ordinary images, selected archive for archive entries.
-    pub root: PathBuf,
-    pub kind: Option<ArchiveKind>,
 }
 
 pub fn catalog_for(path: &Path) -> Result<Catalog, String> {
@@ -121,16 +124,28 @@ pub fn catalog_for(path: &Path) -> Result<Catalog, String> {
                 .into_iter()
                 .map(SourceRef::File)
                 .collect(),
-            root: path.parent().unwrap_or(Path::new("/")).to_path_buf(),
-            kind: None,
         });
     }
-    let before = file_identity(&path).ok_or_else(|| format!("cannot open {}", path.display()))?;
-    let mut zip = open_zip(&path)?;
+    let file = File::open(&path).map_err(|err| format!("cannot open {}: {err}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("cannot read metadata of {}: {err}", path.display()))?;
+    let before = (
+        metadata.len(),
+        metadata
+            .modified()
+            .map_err(|err| format!("cannot read metadata of {}: {err}", path.display()))?,
+    );
+    let (archive_len, archive_mtime_secs, archive_mtime_nanos) = archive_fingerprint(before);
+    let mut zip = open_zip_reader(file)
+        .map_err(|err| format!("cannot read ZIP {}: {err}", path.display()))?;
     let items = scan_zip(&mut zip, &path)?
         .into_iter()
         .map(|(index, entry)| SourceRef::Archive {
             archive: path.clone(),
+            archive_len,
+            archive_mtime_secs,
+            archive_mtime_nanos,
             kind: ArchiveKind::Zip,
             index,
             name: entry_name(&entry),
@@ -149,11 +164,7 @@ pub fn catalog_for(path: &Path) -> Result<Catalog, String> {
         };
         natural_cmp(a, b)
     });
-    Ok(Catalog {
-        items,
-        root: path,
-        kind: Some(ArchiveKind::Zip),
-    })
+    Ok(Catalog { items })
 }
 
 fn open_zip(path: &Path) -> Result<ZipIterable<File>, String> {
@@ -339,7 +350,11 @@ pub fn read_source_bytes(source: &SourceRef, cap: u64) -> Result<Vec<u8>, String
             size,
             ..
         } => {
-            let before = file_identity(archive).ok_or_else(|| format!("cannot open {source}"))?;
+            let before = file_identity(archive)
+                .filter(|identity| matches_archive_fingerprint(source, *identity))
+                .ok_or_else(|| {
+                    format!("{source}: archive changed or unreadable; reopen the archive")
+                })?;
             let mut zip = open_zip(archive)?;
             let entry = scan_zip(&mut zip, archive)?
                 .into_iter()
@@ -354,7 +369,10 @@ pub fn read_source_bytes(source: &SourceRef, cap: u64) -> Result<Vec<u8>, String
                     "{source}: ZIP entry size does not match its metadata"
                 ));
             }
-            if file_identity(archive) != Some(before) {
+            if file_identity(archive)
+                .filter(|identity| matches_archive_fingerprint(source, *identity))
+                != Some(before)
+            {
                 return Err(format!("{source}: archive changed while reading"));
             }
             Ok(bytes)
@@ -430,11 +448,27 @@ fn file_identity(path: &Path) -> Option<(u64, SystemTime)> {
         .then_some((metadata.len(), metadata.modified().ok()?))
 }
 
+fn archive_fingerprint((len, modified): (u64, SystemTime)) -> (u64, u64, u32) {
+    let modified = modified
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    (len, modified.as_secs(), modified.subsec_nanos())
+}
+
+fn matches_archive_fingerprint(source: &SourceRef, identity: (u64, SystemTime)) -> bool {
+    matches!(source, SourceRef::Archive {
+        archive_len, archive_mtime_secs, archive_mtime_nanos, ..
+    } if archive_fingerprint(identity) == (*archive_len, *archive_mtime_secs, *archive_mtime_nanos))
+}
+
 pub fn source_identity(source: &SourceRef) -> Option<SourceIdentity> {
     // shortcut: replacements preserving length and mtime need content hashing
     // if this ever becomes a real freshness problem.
     let (len, modified) = file_identity(source.path())?;
     if let SourceRef::Archive { archive, index, .. } = source {
+        if !matches_archive_fingerprint(source, (len, modified)) {
+            return None;
+        }
         let mut zip = open_zip(archive).ok()?;
         let entry = scan_zip(&mut zip, archive)
             .ok()?
@@ -453,6 +487,8 @@ pub fn source_identity(source: &SourceRef) -> Option<SourceIdentity> {
     })
 }
 
+// Retained for model's archive/EXIF regressions; production probing starts in C3.
+#[cfg(test)]
 pub fn probe_dimensions(source: &SourceRef, cap: u64) -> Result<(u32, u32), String> {
     let bytes = read_source_bytes(source, cap)?;
     model::validate_webp_chunks(&bytes).map_err(|err| format!("{source}: {err}"))?;
@@ -888,8 +924,6 @@ mod tests {
         ];
         std::fs::write(&path, stored_zip(&entries)).unwrap();
         let catalog = catalog_for(&path).unwrap();
-        assert_eq!(catalog.root, path);
-        assert_eq!(catalog.kind, Some(ArchiveKind::Zip));
         assert_eq!(catalog.items.len(), 5);
         let indices: Vec<_> = catalog
             .items
@@ -940,6 +974,140 @@ mod tests {
     }
 
     #[test]
+    fn catalog_fingerprints_reject_old_entries_after_mtime_or_length_changes() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.zip");
+        std::fs::write(
+            &path,
+            stored_zip(&[
+                (b"a.png", b"unchanged", 0o100644, 0),
+                (b"b.png", b"old", 0o100644, 0),
+            ]),
+        )
+        .unwrap();
+        let items = catalog_for(&path).unwrap().items;
+        let before = file_identity(&path).unwrap();
+        for source in &items {
+            let SourceRef::Archive {
+                archive_len,
+                archive_mtime_secs,
+                archive_mtime_nanos,
+                ..
+            } = source
+            else {
+                panic!()
+            };
+            assert_eq!(
+                (*archive_len, *archive_mtime_secs, *archive_mtime_nanos),
+                archive_fingerprint(before)
+            );
+            assert!(source_identity(source).is_some());
+        }
+        assert_eq!(read_source_bytes(&items[0], 16).unwrap(), b"unchanged");
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(before.1 + Duration::from_secs(2))
+            .unwrap();
+        assert!(source_identity(&items[0]).is_none());
+        assert!(
+            read_source_bytes(&items[0], 16)
+                .unwrap_err()
+                .contains("archive changed")
+        );
+        let fresh = catalog_for(&path).unwrap().items;
+        assert_ne!(fresh[0], items[0]);
+        assert_eq!(read_source_bytes(&fresh[0], 16).unwrap(), b"unchanged");
+        let new_mtime = file_identity(&path).unwrap().1;
+        std::fs::write(
+            &path,
+            stored_zip(&[
+                (b"a.png", b"unchanged", 0o100644, 0),
+                (b"b.png", b"a longer replacement", 0o100644, 0),
+            ]),
+        )
+        .unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(new_mtime)
+            .unwrap();
+        assert_ne!(file_identity(&path).unwrap().0, before.0);
+        assert!(source_identity(&fresh[0]).is_none());
+        assert!(
+            read_source_bytes(&fresh[0], 16)
+                .unwrap_err()
+                .contains("archive changed")
+        );
+        let replaced = catalog_for(&path).unwrap().items;
+        assert_ne!(replaced[0], fresh[0]);
+        assert!(source_identity(&replaced[0]).is_some());
+        assert_eq!(read_source_bytes(&replaced[0], 16).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn preserved_archive_fingerprint_still_checks_entries_but_cannot_detect_unchanged_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.zip");
+        std::fs::write(
+            &path,
+            stored_zip(&[
+                (b"a.png", b"aaaa", 0o100644, 0),
+                (b"b.png", b"bbbb", 0o100644, 0),
+            ]),
+        )
+        .unwrap();
+        let items = catalog_for(&path).unwrap().items;
+        let before = file_identity(&path).unwrap();
+        let original = source_identity(&items[0]).unwrap();
+        std::fs::write(
+            &path,
+            stored_zip(&[
+                (b"a.png", b"aaaa", 0o100644, 0),
+                (b"b.png", b"cccc", 0o100644, 0),
+            ]),
+        )
+        .unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(before.1)
+            .unwrap();
+        assert_eq!(file_identity(&path), Some(before));
+        assert!(source_identity(&items[1]).is_none());
+        assert!(
+            read_source_bytes(&items[1], 4)
+                .unwrap_err()
+                .contains("archive entry changed")
+        );
+        // The unchanged member has the same fingerprint and entry metadata.
+        assert_eq!(source_identity(&items[0]), Some(original));
+        assert_eq!(read_source_bytes(&items[0], 4).unwrap(), b"aaaa");
+        let replaced = catalog_for(&path).unwrap().items;
+        assert_eq!(items[0], replaced[0]);
+        assert_ne!(items[1], replaced[1]);
+        assert_eq!(read_source_bytes(&replaced[1], 4).unwrap(), b"cccc");
+    }
+
+    #[test]
+    fn archive_fingerprint_keeps_nanoseconds_and_defaults_pre_epoch_times() {
+        use std::time::Duration;
+        let epoch = SystemTime::UNIX_EPOCH;
+        assert_eq!(
+            archive_fingerprint((12, epoch + Duration::new(34, 56))),
+            (12, 34, 56)
+        );
+        assert_eq!(
+            archive_fingerprint((12, epoch - Duration::from_secs(1))),
+            (12, 0, 0)
+        );
+    }
+
+    #[test]
     fn file_identity_and_folder_order_preserve_existing_behavior() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("page10.png");
@@ -964,11 +1132,15 @@ mod tests {
         let path = dir.path().join("bad.zip");
         let good = stored_zip(&[(b"a.png", b"pixels", 0o100644, 0)]);
         std::fs::write(&path, &good).unwrap();
-        let source = catalog_for(&path).unwrap().items.remove(0);
         let mut corrupt = good.clone();
         corrupt[35] ^= 1; // first payload byte, not the central CRC
         std::fs::write(&path, corrupt).unwrap();
-        assert!(read_source_bytes(&source, 100).is_err());
+        let source = catalog_for(&path).unwrap().items.remove(0);
+        assert!(
+            read_source_bytes(&source, 100)
+                .unwrap_err()
+                .contains("cannot read")
+        );
         std::fs::write(&path, &good[..good.len() - 12]).unwrap();
         assert!(catalog_for(&path).is_err());
         assert!(read_source_bytes(&source, 100).is_err());
@@ -1011,13 +1183,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.zip");
         write_zip(&path, &[("a.png", b"pixels")]);
-        let source = catalog_for(&path).unwrap().items.remove(0);
         let mut bytes = std::fs::read(&path).unwrap();
         let name_len = u16::from_le_bytes(bytes[26..28].try_into().unwrap()) as usize;
         let extra_len = u16::from_le_bytes(bytes[28..30].try_into().unwrap()) as usize;
         bytes[30 + name_len + extra_len] = 0x07; // reserved DEFLATE block type
         std::fs::write(&path, bytes).unwrap();
-        assert!(read_source_bytes(&source, 100).is_err());
+        let source = catalog_for(&path).unwrap().items.remove(0);
+        assert!(
+            read_source_bytes(&source, 100)
+                .unwrap_err()
+                .contains("cannot read")
+        );
         std::fs::write(&path, stored_zip(&[(b"notes.txt", b"secret", 0o100644, 1)])).unwrap();
         assert!(catalog_for(&path).unwrap_err().contains("encrypted"));
     }

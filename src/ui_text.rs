@@ -92,7 +92,8 @@ pub struct Catalog {
     pub name_separator: &'static str,
 
     pub error_title: &'static str,
-    pub path_failed: &'static str,
+    pub no_images: &'static str,
+    pub archive_changed: &'static str,
     pub could_not_open: &'static str,
     pub showing_last: &'static str,
     pub settings_warning: &'static str,
@@ -113,7 +114,7 @@ pub static EN: Catalog = Catalog {
     ui_language: Language::English,
 
     open: "Open",
-    open_tooltip: "Open image · Ctrl/Cmd+O",
+    open_tooltip: "Open image or archive · Ctrl/Cmd+O",
     fullscreen: "Full screen",
     fullscreen_tooltip: "Toggle full screen · F11",
     settings: "Settings",
@@ -122,9 +123,9 @@ pub static EN: Catalog = Catalog {
     previews_hide: "Hide previews",
     previews_tooltip: "Show or hide the preview strip · saved automatically",
 
-    open_image: "Open an image",
+    open_image: "Open an image or archive",
     drop_hint: "Drop a file here, or choose Open above.",
-    formats: "PNG · JPEG · WebP · GIF · BMP · ICO · TIFF",
+    formats: "PNG · JPEG · WebP · GIF · BMP · ICO · TIFF · CBZ · ZIP",
     opening_image: "Opening image…",
     reading_file: "Reading the file",
     rotating: "Rotating…",
@@ -195,8 +196,9 @@ pub static EN: Catalog = Catalog {
     idle_read_only: "Read-only · your files stay unchanged",
     name_separator: " + ",
 
-    error_title: "Could not open this image",
-    path_failed: "Could not resolve the selected path:",
+    error_title: "Could not open this image or archive",
+    no_images: "No supported images found.",
+    archive_changed: "Archive changed; reopen it to continue.",
     could_not_open: "Could not open",
     showing_last: "showing last image",
     settings_warning: "Could not load settings; using defaults.",
@@ -210,14 +212,14 @@ pub static EN: Catalog = Catalog {
     saving_before_close: "Saving settings before closing…",
     save_failed: "Applied, but not saved:",
     close_again: "Close again to exit without saving.",
-    open_picker_title: "Open image",
+    open_picker_title: "Open image or archive",
 };
 
 pub static ZH: Catalog = Catalog {
     ui_language: Language::SimplifiedChinese,
 
     open: "打开",
-    open_tooltip: "打开图片 · Ctrl/Cmd+O",
+    open_tooltip: "打开图片或压缩包 · Ctrl/Cmd+O",
     fullscreen: "全屏",
     fullscreen_tooltip: "切换全屏 · F11",
     settings: "设置",
@@ -226,9 +228,9 @@ pub static ZH: Catalog = Catalog {
     previews_hide: "隐藏预览",
     previews_tooltip: "显示或隐藏预览栏 · 自动保存",
 
-    open_image: "打开图片",
+    open_image: "打开图片或压缩包",
     drop_hint: "可将文件拖到此处，或点击上方“打开”。",
-    formats: "PNG · JPEG · WebP · GIF · BMP · ICO · TIFF",
+    formats: "PNG · JPEG · WebP · GIF · BMP · ICO · TIFF · CBZ · ZIP",
     opening_image: "正在打开图片…",
     reading_file: "正在读取文件",
     rotating: "正在旋转…",
@@ -299,8 +301,9 @@ pub static ZH: Catalog = Catalog {
     idle_read_only: "只读 · 文件不会被更改",
     name_separator: " + ",
 
-    error_title: "无法打开此图片",
-    path_failed: "无法解析所选路径：",
+    error_title: "无法打开此图片或压缩包",
+    no_images: "未找到支持的图片。",
+    archive_changed: "压缩包已更改，请重新打开后继续。",
     could_not_open: "无法打开",
     showing_last: "正在显示上一张",
     settings_warning: "无法加载设置，已使用默认值。",
@@ -314,14 +317,14 @@ pub static ZH: Catalog = Catalog {
     saving_before_close: "关闭前正在保存设置…",
     save_failed: "已应用，但未能保存：",
     close_again: "再次关闭即可不保存退出。",
-    open_picker_title: "打开图片",
+    open_picker_title: "打开图片或压缩包",
 };
 
 pub static JA: Catalog = Catalog {
     ui_language: Language::Japanese,
 
     open: "開く",
-    open_tooltip: "画像を開く・Ctrl/Cmd+O",
+    open_tooltip: "画像またはアーカイブを開く・Ctrl/Cmd+O",
     fullscreen: "全画面",
     fullscreen_tooltip: "全画面を切り替え・F11",
     settings: "設定",
@@ -330,9 +333,9 @@ pub static JA: Catalog = Catalog {
     previews_hide: "プレビューを隠す",
     previews_tooltip: "下部のプレビュー欄を表示または非表示・自動保存",
 
-    open_image: "画像を開く",
+    open_image: "画像またはアーカイブを開く",
     drop_hint: "ここにファイルをドロップするか、上の「開く」を選んでください。",
-    formats: "PNG · JPEG · WebP · GIF · BMP · ICO · TIFF",
+    formats: "PNG · JPEG · WebP · GIF · BMP · ICO · TIFF · CBZ · ZIP",
     opening_image: "画像を開いています…",
     reading_file: "ファイルを読み込み中",
     rotating: "回転しています…",
@@ -403,8 +406,9 @@ pub static JA: Catalog = Catalog {
     idle_read_only: "読み取り専用・ファイルは変更されません",
     name_separator: " + ",
 
-    error_title: "この画像を開けませんでした",
-    path_failed: "選択したパスを解決できません：",
+    error_title: "この画像またはアーカイブを開けませんでした",
+    no_images: "対応する画像が見つかりません。",
+    archive_changed: "アーカイブが変更されました。開き直してください。",
     could_not_open: "を開けません",
     showing_last: "前の画像を表示中",
     settings_warning: "設定を読み込めないため、既定値を使用します。",
@@ -418,7 +422,7 @@ pub static JA: Catalog = Catalog {
     saving_before_close: "終了前に設定を保存しています…",
     save_failed: "適用しましたが保存できませんでした：",
     close_again: "もう一度閉じると保存せず終了します。",
-    open_picker_title: "画像を開く",
+    open_picker_title: "画像またはアーカイブを開く",
 };
 
 /// `Automatic` is resolved before this is called; mapping it to English keeps
@@ -557,12 +561,8 @@ impl Catalog {
         format!("{}\n{detail}", self.settings_warning)
     }
 
-    pub fn path_failed_detail(&self, detail: &str) -> String {
-        if self.ui_language == Language::English {
-            format!("{} {detail}", self.path_failed)
-        } else {
-            format!("{}{detail}", self.path_failed)
-        }
+    pub fn open_failed(&self, name: &str, detail: &str) -> String {
+        format!("{}\n{detail}", self.could_not_open(name, false))
     }
 
     pub fn save_failed(&self, detail: &str, closing: bool) -> String {
@@ -706,7 +706,8 @@ mod tests {
             ("idle_read_only", catalog.idle_read_only),
             ("name_separator", catalog.name_separator),
             ("error_title", catalog.error_title),
-            ("path_failed", catalog.path_failed),
+            ("no_images", catalog.no_images),
+            ("archive_changed", catalog.archive_changed),
             ("could_not_open", catalog.could_not_open),
             ("showing_last", catalog.showing_last),
             ("settings_warning", catalog.settings_warning),
@@ -727,7 +728,7 @@ mod tests {
     #[test]
     fn every_catalog_field_is_non_empty() {
         for catalog in [&EN, &ZH, &JA] {
-            assert_eq!(fields(catalog).len(), 94, "catalog field list is stale");
+            assert_eq!(fields(catalog).len(), 95, "catalog field list is stale");
             for (name, value) in fields(catalog) {
                 assert!(!value.trim().is_empty(), "{name} is empty");
             }
@@ -772,7 +773,7 @@ mod tests {
             JA.prefetch_stats(4, 12.5, true, 2)
         );
         assert_ne!(EN.dimensions(10, 20), ZH.dimensions(10, 20));
-        assert_ne!(EN.path_failed_detail("x"), JA.path_failed_detail("x"));
+        assert_ne!(EN.open_failed("x", "detail"), JA.open_failed("x", "detail"));
         assert!(EN.settings_warning("raw detail").contains('\n'));
         assert!(EN.save_failed("raw error", true).contains('\n'));
         assert_eq!(EN.language_name(Language::SimplifiedChinese), "简体中文");

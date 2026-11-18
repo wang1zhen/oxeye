@@ -16,9 +16,7 @@ use image::codecs::gif::GifDecoder;
 use image::metadata::Orientation;
 use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageReader, Limits, RgbaImage};
 
-// Kept here until the UI switches its root module declarations to virtual sources.
 #[path = "source.rs"]
-#[allow(dead_code)] // C1a API; catalog and dimension consumers arrive with the UI switch.
 pub mod source;
 use source::{SourceRef, read_source_bytes};
 
@@ -76,7 +74,6 @@ pub struct MediaFrame {
 #[derive(Debug)]
 pub struct LoadedMedia {
     pub source: SourceRef,
-    pub path: PathBuf,
     pub frames: Vec<MediaFrame>,
     pub loop_mode: LoopMode,
 }
@@ -84,6 +81,7 @@ pub struct LoadedMedia {
 /// A decoded image and the absolute selected path it was opened from.
 #[derive(Debug)]
 pub struct LoadedImage {
+    #[cfg(test)]
     pub path: PathBuf,
     pub pixels: RgbaImage,
 }
@@ -91,7 +89,7 @@ pub struct LoadedImage {
 /// Decodes `path` into RGBA, applying its EXIF orientation.
 ///
 /// This is a test-only helper retained for static-decode regressions; the UI
-/// uses [`load_media`].
+/// uses [`load_media_for_source`].
 #[cfg(test)]
 pub fn load_image(path: &Path) -> Result<LoadedImage, String> {
     load_image_bounded(path, MAX_ENCODED_BYTES)
@@ -147,6 +145,7 @@ fn decode_static_bytes(absolute: &Path, bytes: Vec<u8>) -> Result<LoadedImage, S
     image.apply_orientation(orientation);
 
     Ok(LoadedImage {
+        #[cfg(test)]
         path: absolute.to_path_buf(),
         pixels: image.into_rgba8(),
     })
@@ -158,7 +157,7 @@ fn decode_static_bytes(absolute: &Path, bytes: Vec<u8>) -> Result<LoadedImage, S
 /// frame in [`LoopMode::Once`]. GIF frames are decoded sequentially
 /// with the image compositor and checked against the retained-RGBA and
 /// frame-count budgets.
-#[allow(dead_code)] // Retained Path compatibility API.
+#[cfg(test)]
 pub fn load_media(path: &Path, cancel: &AtomicBool) -> Result<LoadedMedia, String> {
     load_media_for(path, cancel, DecodePurpose::Animated)
 }
@@ -168,7 +167,7 @@ pub fn load_media(path: &Path, cancel: &AtomicBool) -> Result<LoadedMedia, Strin
 /// [`DecodePurpose::Animated`] is identical to [`load_media`]. `Still` always
 /// returns one zero-delay [`LoopMode::Once`] frame; animated GIFs decode only
 /// their first composited logical screen, reusing the bounded static decoder.
-#[allow(dead_code)] // Retained Path compatibility API.
+#[cfg(test)]
 pub fn load_media_for(
     path: &Path,
     cancel: &AtomicBool,
@@ -254,7 +253,6 @@ fn decode_media_bytes(
     }
     Ok(LoadedMedia {
         source: source.clone(),
-        path: absolute.to_path_buf(),
         frames,
         loop_mode,
     })
@@ -263,7 +261,6 @@ fn decode_media_bytes(
 fn still_media(loaded: LoadedImage, source: SourceRef) -> LoadedMedia {
     LoadedMedia {
         source,
-        path: loaded.path,
         frames: vec![MediaFrame {
             pixels: Arc::new(loaded.pixels),
             delay: Duration::ZERO,
@@ -1033,7 +1030,7 @@ mod tests {
 
         let media = load_media(&path, &AtomicBool::new(false)).expect("load static media");
 
-        assert_eq!(media.path, std::path::absolute(&path).unwrap());
+        assert_eq!(media.source, SourceRef::file(&path));
         assert_eq!(media.loop_mode, LoopMode::Once);
         assert_eq!(media.frames.len(), 1);
         assert_eq!(media.frames[0].delay, Duration::ZERO);
@@ -1076,7 +1073,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let still = load_media_for_source(&items[0], &cancel, DecodePurpose::Still).unwrap();
         assert_eq!(still.source, items[0]);
-        assert_eq!(still.path, path);
+        assert_eq!(still.source.path(), path);
         assert_eq!(still.frames[0].pixels.as_ref(), &sample_pixels());
         assert_eq!(
             probe_dimensions(&items[0], MAX_ENCODED_BYTES).unwrap(),
