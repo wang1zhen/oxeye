@@ -1,5 +1,5 @@
 use crate::{
-    navigation::{Navigation, NavigationQueue},
+    navigation::{Navigation, NavigationQueue, PageLayout},
     settings::{AppSettings, ComicArrowDirection, ReadingMode},
 };
 #[cfg(test)]
@@ -93,6 +93,19 @@ impl NavigationFlow {
         self.queue.enqueue(action, base, length, mode)
     }
 
+    pub fn enqueue_with(
+        &mut self,
+        action: Navigation,
+        base: usize,
+        layout: &dyn PageLayout,
+    ) -> bool {
+        self.queue.enqueue_with(action, base, layout)
+    }
+
+    pub fn retarget(&mut self, base: usize, layout: &dyn PageLayout) {
+        self.queue.retarget(base, layout);
+    }
+
     pub fn is_idle(&self) -> bool {
         self.queue.is_idle()
     }
@@ -153,6 +166,32 @@ impl NavigationFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retarget_preserves_active_ticket_and_paint_barrier() {
+        let mut flow = NavigationFlow::default();
+        assert!(flow.enqueue(Navigation::Next, 0, 6, ReadingMode::Book));
+        assert!(flow.enqueue(Navigation::Next, 0, 6, ReadingMode::Book));
+        let first = flow.start_next(10).unwrap();
+        assert_eq!(first.index, 1);
+        assert_eq!(flow.painted(10), Some(first));
+        flow.retarget(
+            1,
+            &crate::navigation::FixedLayout {
+                length: 6,
+                mode: ReadingMode::Single,
+            },
+        );
+        assert_eq!(flow.pending_len(), 1);
+        assert!(flow.start_next(11).is_none());
+        assert!(flow.crossed_frame(first));
+        let next = flow.start_next(11).unwrap();
+        assert_eq!(next.index, 2);
+        assert!(!flow.crossed_frame(next));
+        assert_eq!(flow.painted(11), Some(next));
+        assert!(flow.crossed_frame(next));
+        assert!(flow.is_idle());
+    }
 
     #[test]
     fn book_fifo_waits_for_whole_spread_paint_and_uses_file_jump_normalization() {

@@ -3,6 +3,7 @@
 //! Only app-authored wording lives here. File names, paths, format names, key
 //! names, and raw technical diagnostics stay untranslated.
 
+use crate::progress::PageOverride;
 use crate::settings::Language;
 
 pub struct Catalog {
@@ -38,6 +39,14 @@ pub struct Catalog {
     pub single_image: &'static str,
     pub book_rtl: &'static str,
     pub reading_tooltip: &'static str,
+    pub wide_pages: &'static str,
+    pub auto_wide_auto: &'static str,
+    pub auto_wide_off: &'static str,
+    pub auto_wide_tooltip: &'static str,
+    pub wide_auto: &'static str,
+    pub wide_single: &'static str,
+    pub wide_spread: &'static str,
+    pub wide_tooltip: &'static str,
     pub book_next_spread: &'static str,
     pub right_arrow: &'static str,
     pub left_arrow: &'static str,
@@ -145,6 +154,14 @@ pub static EN: Catalog = Catalog {
     single_image: "Single image",
     book_rtl: "Book · right to left",
     reading_tooltip: "Switch between one image and right-to-left spreads",
+    wide_pages: "Wide pages",
+    auto_wide_auto: "Auto",
+    auto_wide_off: "Off",
+    auto_wide_tooltip: "Automatically show wide pages alone in Book mode",
+    wide_auto: "Wide: Auto",
+    wide_single: "Wide: Single",
+    wide_spread: "Wide: Spread",
+    wide_tooltip: "Toggle wide page · W",
     book_next_spread: "Book: next spread",
     right_arrow: "Right arrow",
     left_arrow: "Left arrow",
@@ -252,6 +269,14 @@ pub static ZH: Catalog = Catalog {
     single_image: "单图",
     book_rtl: "漫画 · 从右到左",
     reading_tooltip: "在单图与从右到左的双页漫画之间切换",
+    wide_pages: "宽页",
+    auto_wide_auto: "自动",
+    auto_wide_off: "关闭",
+    auto_wide_tooltip: "在漫画模式中自动单独显示宽页",
+    wide_auto: "宽页：自动",
+    wide_single: "宽页：单页",
+    wide_spread: "宽页：双页",
+    wide_tooltip: "切换宽页显示方式 · W",
     book_next_spread: "漫画：下一跨页",
     right_arrow: "右方向键",
     left_arrow: "左方向键",
@@ -359,6 +384,14 @@ pub static JA: Catalog = Catalog {
     single_image: "単一画像",
     book_rtl: "ブック・右から左",
     reading_tooltip: "単一画像と右開きの見開きを切り替え",
+    wide_pages: "横長のページ",
+    auto_wide_auto: "自動",
+    auto_wide_off: "オフ",
+    auto_wide_tooltip: "ブックモードで横長のページを自動で単独表示",
+    wide_auto: "横長：自動",
+    wide_single: "横長：単独",
+    wide_spread: "横長：見開き",
+    wide_tooltip: "横長ページの表示を切り替え・W",
     book_next_spread: "ブック：次の見開き",
     right_arrow: "右矢印",
     left_arrow: "左矢印",
@@ -444,6 +477,14 @@ pub fn catalog(language: Language) -> &'static Catalog {
 }
 
 impl Catalog {
+    pub fn wide_label(&self, mode: PageOverride) -> &'static str {
+        match mode {
+            PageOverride::Auto => self.wide_auto,
+            PageOverride::Single => self.wide_single,
+            PageOverride::Spread => self.wide_spread,
+        }
+    }
+
     pub fn dimensions(&self, width: u32, height: u32) -> String {
         format!("{width} × {height} {}", self.pixel_read_only)
     }
@@ -675,6 +716,14 @@ mod tests {
             ("single_image", catalog.single_image),
             ("book_rtl", catalog.book_rtl),
             ("reading_tooltip", catalog.reading_tooltip),
+            ("wide_pages", catalog.wide_pages),
+            ("auto_wide_auto", catalog.auto_wide_auto),
+            ("auto_wide_off", catalog.auto_wide_off),
+            ("auto_wide_tooltip", catalog.auto_wide_tooltip),
+            ("wide_auto", catalog.wide_auto),
+            ("wide_single", catalog.wide_single),
+            ("wide_spread", catalog.wide_spread),
+            ("wide_tooltip", catalog.wide_tooltip),
             ("book_next_spread", catalog.book_next_spread),
             ("right_arrow", catalog.right_arrow),
             ("left_arrow", catalog.left_arrow),
@@ -750,7 +799,7 @@ mod tests {
     #[test]
     fn every_catalog_field_is_non_empty() {
         for catalog in [&EN, &ZH, &JA] {
-            assert_eq!(fields(catalog).len(), 97, "catalog field list is stale");
+            assert_eq!(fields(catalog).len(), 105, "catalog field list is stale");
             for (name, value) in fields(catalog) {
                 assert!(!value.trim().is_empty(), "{name} is empty");
             }
@@ -767,6 +816,18 @@ mod tests {
         ] {
             let text = catalog.could_not_open("photo.png", true);
             assert!(text.contains(marker));
+            assert_eq!(catalog.wide_label(PageOverride::Auto), catalog.wide_auto);
+            assert_eq!(
+                catalog.wide_label(PageOverride::Single),
+                catalog.wide_single
+            );
+            assert_eq!(
+                catalog.wide_label(PageOverride::Spread),
+                catalog.wide_spread
+            );
+            assert!(catalog.wide_tooltip.contains('W'));
+            assert_ne!(catalog.wide_auto, catalog.wide_single);
+            assert_ne!(catalog.wide_single, catalog.wide_spread);
             assert!(text.contains("photo.png"));
             assert!(catalog.dimensions(640, 480).contains("640 × 480"));
             assert!(catalog.book_pages(2).contains('2'));

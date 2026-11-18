@@ -482,6 +482,13 @@ impl Prefetcher {
         self.inner.shared.notify();
     }
 
+    /// A cache-only dimension hint: no freshness I/O, promotion, or hit accounting.
+    pub fn cached_dimensions(&self, source: &SourceRef) -> Option<(u32, u32)> {
+        let state = lock(&self.inner.shared.state);
+        let frame = state.cache.get(source)?.decoded.media.frames.first()?;
+        Some(frame.pixels.dimensions())
+    }
+
     /// Non-consuming cache/current/reservation lookup for the thumbnail worker.
     ///
     /// Background use only. Returns a borrowed `Arc` without promoting,
@@ -1459,6 +1466,86 @@ mod tests {
                     .upgrade()
                     .is_some_and(|media| media.source == SourceRef::file(path))
             })
+    }
+
+    #[test]
+    fn cached_neighbor_dimensions_do_not_consume_pixels_or_change_accounting() {
+        let dir = TempDir::new();
+        let first = dir.file("a.png");
+        let neighbor = dir.file("b.png");
+        let prefetch = with_fake(settings(0, 1, 1), fixed(16, 32, 2));
+        prefetch.update_context(
+            vec![first.clone(), neighbor.clone()],
+            Some(first.clone()),
+            None,
+        );
+        prefetch.set_allowed(true);
+        wait_until(|| prefetch.stats().entries == 1);
+        prefetch.set_allowed(false);
+        let source = SourceRef::file(&neighbor);
+        let before = prefetch.stats();
+        let owners = {
+            let state = lock(&prefetch.inner.shared.state);
+            Arc::strong_count(&state.cache[&source].decoded.media)
+        };
+        fs::remove_file(&neighbor).unwrap();
+        assert_eq!(prefetch.cached_dimensions(&source), Some((16, 32)));
+        assert_eq!(prefetch.cached_dimensions(&SourceRef::file(&first)), None);
+        assert_eq!(prefetch.stats(), before);
+        let state = lock(&prefetch.inner.shared.state);
+        assert_eq!(
+            Arc::strong_count(&state.cache[&source].decoded.media),
+            owners
+        );
+        drop(state);
+        prefetch.shutdown();
+    }
+
+    #[test]
+    fn cached_archive_dimensions_never_open_or_validate_the_archive() {
+        use crate::model::source::ArchiveKind;
+        let dir = TempDir::new();
+        let path = dir.0.join("never-created.cbz");
+        let source = SourceRef::Archive {
+            archive: path.clone(),
+            archive_len: 123,
+            archive_mtime_secs: 0,
+            archive_mtime_nanos: 0,
+            kind: ArchiveKind::Zip,
+            index: 9,
+            name: "page.png".into(),
+            size: 0,
+            crc: 0,
+        };
+        let mut decoded = media(&path, 4, 8, 1);
+        decoded.source = source.clone();
+        let prefetch = Prefetcher::new(settings(0, 0, 0));
+        {
+            let mut state = lock(&prefetch.inner.shared.state);
+            state.bytes = media_bytes(&decoded);
+            let bytes = state.bytes;
+            state.cache.insert(
+                source.clone(),
+                CacheEntry {
+                    decoded: DecodedEntry {
+                        media: Arc::new(decoded),
+                        identity: SourceIdentity {
+                            len: 123,
+                            modified: SystemTime::UNIX_EPOCH,
+                            entry: Some(source.clone()),
+                        },
+                        purpose: DecodePurpose::Animated,
+                    },
+                    bytes,
+                },
+            );
+        }
+        let before = prefetch.stats();
+        assert!(!path.exists());
+        assert_eq!(prefetch.cached_dimensions(&source), Some((4, 8)));
+        assert_eq!(prefetch.stats(), before);
+        assert!(!path.exists());
+        prefetch.shutdown();
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Pure navigation math and the sequential-navigation queue.
 //!
-//! No UI or decoder types live here: the queue stores only destination file
-//! indices. The UI decides when a rendered frame is committed and calls
+//! No UI or decoder types live here: the queue stores actions and destination
+//! file indices. The UI decides when a rendered frame is committed and calls
 //! [`NavigationQueue::complete`] at that boundary.
 
 use std::collections::VecDeque;
@@ -15,6 +15,38 @@ pub enum Navigation {
     Next,
     /// Offset by this many files, clamped to the directory, then normalized.
     JumpFiles(isize),
+}
+
+/// Immutable page grouping used by navigation and reading-order rendering.
+pub trait PageLayout {
+    fn length(&self) -> usize;
+    fn anchor(&self, index: usize) -> Option<usize>;
+    fn pages(&self, index: usize) -> Vec<usize>;
+    fn destination(&self, index: usize, action: Navigation) -> Option<usize>;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FixedLayout {
+    pub length: usize,
+    pub mode: ReadingMode,
+}
+
+impl PageLayout for FixedLayout {
+    fn length(&self) -> usize {
+        self.length
+    }
+
+    fn anchor(&self, index: usize) -> Option<usize> {
+        anchor(index, self.length, self.mode)
+    }
+
+    fn pages(&self, index: usize) -> Vec<usize> {
+        pages(index, self.length, self.mode)
+    }
+
+    fn destination(&self, index: usize, action: Navigation) -> Option<usize> {
+        destination(index, self.length, self.mode, action)
+    }
 }
 
 /// Normalizes a file index to the first index of its view.
@@ -88,10 +120,10 @@ pub fn destination(
 
 /// Sequential navigation requests, computed against the queued tail.
 ///
-/// Only destination indices are stored; no decoded pixels or owning resources.
+/// Only actions and destination indices are stored; no decoded pixels or owning resources.
 #[derive(Default)]
 pub struct NavigationQueue {
-    pending: VecDeque<usize>,
+    pending: VecDeque<(Navigation, usize)>,
     active: Option<usize>,
     generation: u64,
 }
@@ -108,17 +140,39 @@ impl NavigationQueue {
         length: usize,
         mode: ReadingMode,
     ) -> bool {
+        self.enqueue_with(action, base_index, &FixedLayout { length, mode })
+    }
+
+    pub fn enqueue_with(
+        &mut self,
+        action: Navigation,
+        base_index: usize,
+        layout: &dyn PageLayout,
+    ) -> bool {
         let current = self
             .pending
             .back()
-            .copied()
+            .map(|&(_, target)| target)
             .or(self.active)
             .unwrap_or(base_index);
-        let Some(target) = destination(current, length, mode, action) else {
+        let Some(target) = layout.destination(current, action) else {
             return false;
         };
-        self.pending.push_back(target);
+        self.pending.push_back((action, target));
         true
+    }
+
+    /// Replays pending actions from the corrected base, leaving active work unchanged.
+    pub fn retarget(&mut self, base: usize, layout: &dyn PageLayout) {
+        let mut current = base;
+        self.pending.retain_mut(|(action, target)| {
+            let Some(next) = layout.destination(current, *action) else {
+                return false;
+            };
+            *target = next;
+            current = next;
+            true
+        });
     }
 
     /// Pops the next target once the previous one has completed and renders it.
@@ -126,7 +180,7 @@ impl NavigationQueue {
         if self.active.is_some() {
             return None;
         }
-        let next = self.pending.pop_front()?;
+        let (_, next) = self.pending.pop_front()?;
         self.active = Some(next);
         Some(next)
     }
@@ -171,6 +225,107 @@ mod tests {
     use super::Navigation::*;
     use super::*;
     use crate::settings::ReadingMode::{Book, Single};
+
+    #[test]
+    fn retarget_visits_new_wide_page_and_preserves_active_and_generation() {
+        use crate::comic::comic_layout;
+        use std::collections::{BTreeMap, HashMap};
+
+        let original = comic_layout(6, &HashMap::new(), &BTreeMap::new(), true);
+        let updated = comic_layout(6, &HashMap::from([(2, (400, 100))]), &BTreeMap::new(), true);
+        for active in [false, true] {
+            let mut queue = NavigationQueue::default();
+            queue.clear();
+            let generation = queue.generation();
+            assert!(queue.enqueue_with(Next, 0, &original));
+            assert!(queue.enqueue_with(Next, 0, &original));
+            assert_eq!(queue.pending, [(Next, 1), (Next, 3)]);
+            if active {
+                assert_eq!(queue.start_next(), Some(1));
+            }
+            queue.retarget(if active { 1 } else { 0 }, &updated);
+            assert_eq!(queue.generation(), generation);
+            if active {
+                assert_eq!(queue.active, Some(1));
+                assert_eq!(queue.start_next(), None);
+                assert!(queue.complete(1));
+            } else {
+                assert_eq!(queue.start_next(), Some(1));
+                assert!(queue.complete(1));
+            }
+            assert_eq!(queue.start_next(), Some(2));
+            assert!(queue.complete(2));
+            assert!(queue.is_idle());
+        }
+    }
+
+    #[test]
+    fn retarget_drops_boundary_and_jump_noops_without_reordering() {
+        let mut queue = NavigationQueue::default();
+        for action in [Next, Next, Previous, JumpFiles(-1)] {
+            assert!(queue.enqueue(action, 0, 5, Single));
+        }
+        queue.retarget(
+            1,
+            &FixedLayout {
+                length: 2,
+                mode: Single,
+            },
+        );
+        assert_eq!(queue.pending, [(Previous, 0)]);
+        assert_eq!(queue.start_next(), Some(0));
+        assert!(queue.complete(0));
+        assert!(queue.is_idle());
+
+        assert!(queue.enqueue(Next, 0, 5, Single));
+        queue.retarget(
+            0,
+            &FixedLayout {
+                length: 0,
+                mode: Single,
+            },
+        );
+        assert!(queue.is_idle());
+    }
+
+    #[test]
+    fn fixed_layout_retarget_preserves_actions_and_targets() {
+        for mode in [Single, Book] {
+            let layout = FixedLayout { length: 16, mode };
+            let mut queue = NavigationQueue::default();
+            for action in [Next, Next, Previous, JumpFiles(10), JumpFiles(-10)] {
+                assert!(queue.enqueue(action, 0, layout.length, mode));
+            }
+            let expected = queue.pending.clone();
+            queue.retarget(0, &layout);
+            assert_eq!(queue.pending, expected);
+            assert_eq!(queue.start_next(), Some(1));
+            let expected = queue.pending.clone();
+            queue.retarget(1, &layout);
+            assert_eq!(queue.pending, expected);
+            assert_eq!(queue.active, Some(1));
+        }
+    }
+
+    #[test]
+    fn fixed_layout_matches_existing_navigation_functions() {
+        for length in [0, 1, 2, 3, 6] {
+            for mode in [Single, Book] {
+                let layout = FixedLayout { length, mode };
+                assert_eq!(layout.length(), length);
+                for index in 0..=length {
+                    assert_eq!(layout.anchor(index), anchor(index, length, mode));
+                    assert_eq!(layout.pages(index), pages(index, length, mode));
+                    for action in [Next, Previous, JumpFiles(-10), JumpFiles(0), JumpFiles(10)] {
+                        assert_eq!(
+                            layout.destination(index, action),
+                            destination(index, length, mode, action)
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn first_next_waits_for_render_completion() {

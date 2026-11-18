@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Upper bound for the settings file. Anything larger is refused unread.
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 /// The on-disk schema version written by this build.
-const SETTINGS_VERSION: u32 = 3;
+const SETTINGS_VERSION: u32 = 4;
 /// Oldest on-disk schema version still understood.
 const MIN_SETTINGS_VERSION: u32 = 1;
 /// Default preload count in each direction.
@@ -117,6 +117,8 @@ pub struct AppSettings {
     pub thumbnails_visible: bool,
     /// Single-page or right-to-left book layout.
     pub reading_mode: ReadingMode,
+    /// Automatically show wide pages alone in book layout.
+    pub auto_wide: bool,
     /// Whether the right or left arrow advances in book mode.
     pub comic_arrow_direction: ComicArrowDirection,
     /// UI language, or Automatic to follow the system locale.
@@ -129,6 +131,7 @@ impl Default for AppSettings {
             prefetch: PrefetchSettings::default(),
             thumbnails_visible: true,
             reading_mode: ReadingMode::default(),
+            auto_wide: true,
             comic_arrow_direction: ComicArrowDirection::default(),
             language: Language::default(),
         }
@@ -150,15 +153,14 @@ pub struct LoadedSettings {
     pub warning: Option<String>,
 }
 
-fn default_thumbnails_visible() -> bool {
+fn default_true() -> bool {
     true
 }
 
 /// On-disk shape, including the schema version.
 ///
-/// Cache fields stay flat for compatibility. New fields are optional so a
-/// version-1 file loads with defaults for them; unknown fields are still
-/// rejected by the version-specific validation below.
+/// Cache fields stay flat for compatibility. New fields are optional so an
+/// older file loads with defaults for them; unknown fields are still rejected.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettingsFile {
@@ -166,10 +168,12 @@ struct SettingsFile {
     before: usize,
     after: usize,
     memory_mib: u64,
-    #[serde(default = "default_thumbnails_visible")]
+    #[serde(default = "default_true")]
     thumbnails_visible: bool,
     #[serde(default)]
     reading_mode: ReadingMode,
+    #[serde(default = "default_true")]
+    auto_wide: bool,
     #[serde(default)]
     comic_arrow_direction: ComicArrowDirection,
     #[serde(default)]
@@ -185,6 +189,7 @@ impl SettingsFile {
             memory_mib: settings.prefetch.memory_mib,
             thumbnails_visible: settings.thumbnails_visible,
             reading_mode: settings.reading_mode,
+            auto_wide: settings.auto_wide,
             comic_arrow_direction: settings.comic_arrow_direction,
             language: settings.language,
         }
@@ -199,6 +204,7 @@ impl SettingsFile {
             },
             thumbnails_visible: self.thumbnails_visible,
             reading_mode: self.reading_mode,
+            auto_wide: self.auto_wide,
             comic_arrow_direction: self.comic_arrow_direction,
             language: self.language,
         }
@@ -371,6 +377,7 @@ mod tests {
         assert_eq!(settings.prefetch.after, 5);
         assert_eq!(settings.prefetch.memory_mib, 256);
         assert!(settings.thumbnails_visible);
+        assert!(settings.auto_wide);
         assert_eq!(settings.reading_mode, ReadingMode::Single);
         assert_eq!(
             settings.comic_arrow_direction,
@@ -435,6 +442,7 @@ mod tests {
             },
             thumbnails_visible: false,
             reading_mode: ReadingMode::Book,
+            auto_wide: false,
             comic_arrow_direction: ComicArrowDirection::LeftNext,
             language: Language::Japanese,
         };
@@ -445,18 +453,19 @@ mod tests {
 
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(written["version"], 3);
+        assert_eq!(written["version"], 4);
         assert_eq!(written["before"], 3);
         assert_eq!(written["after"], 7);
         assert_eq!(written["memory_mib"], 128);
         assert_eq!(written["thumbnails_visible"], false);
         assert_eq!(written["reading_mode"], "book");
+        assert_eq!(written["auto_wide"], false);
         assert_eq!(written["comic_arrow_direction"], "left_next");
         assert_eq!(written["language"], "japanese");
     }
 
     #[test]
-    fn version_three_round_trips_each_language() {
+    fn version_four_round_trips_each_language() {
         let dir = TempDir::new();
         let path = dir.path().join("settings.json");
         for (language, expected) in [
@@ -475,7 +484,8 @@ mod tests {
             assert_eq!(loaded.warning, None);
             let written: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            assert_eq!(written["version"], 3);
+            assert_eq!(written["version"], 4);
+            assert_eq!(written["auto_wide"], true);
             assert_eq!(written["language"], expected);
         }
     }
@@ -501,6 +511,7 @@ mod tests {
             }
         );
         assert_eq!(loaded.settings.language, Language::Automatic);
+        assert!(loaded.settings.auto_wide);
         // Loading never rewrites the file; migration happens on the next save.
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
@@ -524,10 +535,56 @@ mod tests {
                 },
                 thumbnails_visible: false,
                 reading_mode: ReadingMode::Book,
+                auto_wide: true,
                 comic_arrow_direction: ComicArrowDirection::LeftNext,
                 language: Language::Automatic,
             }
         );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn version_three_migrates_custom_values_and_defaults_auto_wide() {
+        let dir = TempDir::new();
+        let path = dir.path().join("settings.json");
+        let original = br#"{"version":3,"before":4,"after":6,"memory_mib":64,"thumbnails_visible":false,"reading_mode":"book","comic_arrow_direction":"left_next","language":"japanese"}"#;
+        std::fs::write(&path, original).unwrap();
+
+        let loaded = load_settings_from(&path);
+        assert_eq!(loaded.warning, None);
+        assert_eq!(
+            loaded.settings,
+            AppSettings {
+                prefetch: PrefetchSettings {
+                    before: 4,
+                    after: 6,
+                    memory_mib: 64,
+                },
+                thumbnails_visible: false,
+                reading_mode: ReadingMode::Book,
+                auto_wide: true,
+                comic_arrow_direction: ComicArrowDirection::LeftNext,
+                language: Language::Japanese,
+            }
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        save_settings_to(&path, &loaded.settings).unwrap();
+        assert_eq!(load_settings_from(&path).settings, loaded.settings);
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["version"], 4);
+        assert_eq!(written["auto_wide"], true);
+    }
+
+    #[test]
+    fn version_four_missing_auto_wide_defaults_true() {
+        let dir = TempDir::new();
+        let path = dir.path().join("settings.json");
+        let original = br#"{"version":4,"before":5,"after":5,"memory_mib":256}"#;
+        std::fs::write(&path, original).unwrap();
+        let loaded = load_settings_from(&path);
+        assert_eq!(loaded.warning, None);
+        assert_eq!(loaded.settings, AppSettings::default());
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
@@ -551,7 +608,7 @@ mod tests {
         assert_eq!(loaded.settings, AppSettings::default());
         assert!(loaded.warning.is_some());
 
-        let future = br#"{"version":4,"before":1,"after":1,"memory_mib":1}"#;
+        let future = br#"{"version":5,"before":1,"after":1,"memory_mib":1}"#;
         std::fs::write(&path, future).unwrap();
         let loaded = load_settings_from(&path);
         assert_eq!(loaded.settings, AppSettings::default());
@@ -592,6 +649,17 @@ mod tests {
         assert_eq!(loaded.settings, AppSettings::default());
         assert!(loaded.warning.is_some());
         assert_eq!(std::fs::read(&path).unwrap(), invalid_language);
+
+        for invalid in [
+            r#"{"version":4,"before":1,"after":1,"memory_mib":1,"auto_wide":"true"}"#,
+            r#"{"version":4,"before":1,"after":1,"memory_mib":1,"auto_wide":true,"bogus":true}"#,
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            let loaded = load_settings_from(&path);
+            assert_eq!(loaded.settings, AppSettings::default());
+            assert!(loaded.warning.is_some());
+            assert_eq!(std::fs::read(&path).unwrap(), invalid.as_bytes());
+        }
     }
 
     #[test]
@@ -599,7 +667,7 @@ mod tests {
         let dir = TempDir::new();
         let path = dir.path().join("settings.json");
         let original =
-            br#"{"version":4,"before":2,"after":3,"memory_mib":128,"language":"japanese"}"#;
+            br#"{"version":5,"before":2,"after":3,"memory_mib":128,"language":"japanese"}"#;
         std::fs::write(&path, original).unwrap();
 
         let loaded = load_settings_from(&path);

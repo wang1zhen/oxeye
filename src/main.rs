@@ -1,10 +1,9 @@
 //! Oxeye: a small read-only image viewer built on egui/eframe.
 
+mod comic;
 mod model;
 mod navigation;
 mod preload;
-// Override APIs stay unused until the wide-page UI lands.
-#[allow(dead_code)]
 mod progress;
 mod settings;
 mod spread_playback;
@@ -17,7 +16,7 @@ mod viewer;
 #[cfg(test)]
 use std::path::Path;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -39,9 +38,12 @@ use settings::PrefetchSettings;
 use settings::{Language, resolve_language};
 use spread_playback::{PageTiming, SpreadPlayback};
 
+#[cfg(test)]
+use comic::is_wide;
+use comic::{ComicLayout, comic_layout};
 use model::DecodePurpose;
 use model::source::{SourceRef, catalog_for, source_identity};
-use navigation::Navigation;
+use navigation::{FixedLayout, Navigation, PageLayout};
 use preload::{CacheStats, ForegroundToken, Prefetcher};
 use progress::{PageOverride, ProgressStore};
 use settings::{ComicArrowDirection, ReadingMode};
@@ -77,6 +79,7 @@ enum Action {
     Close,
     Settings,
     ToggleMode,
+    WideToggle,
 }
 
 /// Maps one key press to one viewer action. Keeping this pure makes key order
@@ -125,12 +128,13 @@ fn key_action(key: Key, modifiers: Modifiers) -> Option<Action> {
         Key::Num0 => Some(Action::Actual),
         Key::P => Some(Action::Playback),
         Key::M if !modifiers.shift => Some(Action::ToggleMode),
+        Key::W if modifiers == Modifiers::NONE => Some(Action::WideToggle),
         _ => None,
     }
 }
 
 fn action_allows_repeat(action: Action) -> bool {
-    !matches!(action, Action::ToggleMode)
+    !matches!(action, Action::ToggleMode | Action::WideToggle)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,16 +171,13 @@ const SETTING_AFTER: usize = 1;
 const SETTING_MEMORY: usize = 2;
 const SETTING_PREVIEWS: usize = 3;
 const SETTING_READING: usize = 4;
-const SETTING_ARROW: usize = 5;
-const SETTING_LANGUAGE: usize = 6;
-const SETTING_RESTORE: usize = 7;
-const SETTING_CANCEL: usize = 8;
-const SETTING_APPLY: usize = 9;
-const SETTING_COUNT: usize = 10;
-
-/// Wide-page overrides stay empty until the wide-page UI lands; keep the
-/// stored policy type wired in now.
-const _: PageOverride = PageOverride::Auto;
+const SETTING_AUTO_WIDE: usize = 5;
+const SETTING_ARROW: usize = 6;
+const SETTING_LANGUAGE: usize = 7;
+const SETTING_RESTORE: usize = 8;
+const SETTING_CANCEL: usize = 9;
+const SETTING_APPLY: usize = 10;
+const SETTING_COUNT: usize = 11;
 
 /// Reading progress is small; one write after the page settles is enough.
 const PROGRESS_SAVE_DELAY: Duration = Duration::from_millis(500);
@@ -313,6 +314,7 @@ fn step_draft_setting(control: usize, increase: bool, draft: &mut AppSettings) {
         }
         SETTING_PREVIEWS => draft.thumbnails_visible = !draft.thumbnails_visible,
         SETTING_READING => draft.reading_mode = toggled_reading_mode(draft.reading_mode),
+        SETTING_AUTO_WIDE => draft.auto_wide = !draft.auto_wide,
         SETTING_ARROW => {
             draft.comic_arrow_direction = toggled_arrow_direction(draft.comic_arrow_direction)
         }
@@ -341,6 +343,23 @@ fn mode_target(
 fn source_index(selected: Option<&SourceRef>, siblings: &[SourceRef]) -> Option<usize> {
     let selected = selected?;
     siblings.iter().position(|source| source == selected)
+}
+
+/// Progress stores archive member indices; layouts use sorted catalogue
+/// positions. Saving an override must translate back the same way.
+fn translate_overrides(
+    overrides: BTreeMap<usize, PageOverride>,
+    siblings: &[SourceRef],
+) -> BTreeMap<usize, PageOverride> {
+    overrides
+        .into_iter()
+        .filter_map(|(member, mode)| {
+            let position = siblings.iter().position(
+                |source| matches!(source, SourceRef::Archive { index, .. } if *index == member),
+            )?;
+            Some((position, mode))
+        })
+        .collect()
 }
 
 fn source_label(source: &SourceRef) -> String {
@@ -418,6 +437,7 @@ enum Work {
         ForegroundToken,
         u32,
         ReadingMode,
+        Vec<usize>,
         Language,
     ),
     Spread {
@@ -661,7 +681,7 @@ fn prepare(work: Work, cancelled: &AtomicBool) -> WorkResult {
         };
     }
     match work {
-        Work::Load(path, prefetch, foreground, cap, mode, language) => {
+        Work::Load(path, prefetch, foreground, cap, mode, spread, language) => {
             // Scan even when decoding fails, so a corrupt first file does not trap navigation.
             let siblings = match &path {
                 SourceRef::File(file) => model::sibling_images(file)
@@ -669,16 +689,21 @@ fn prepare(work: Work, cancelled: &AtomicBool) -> WorkResult {
                 SourceRef::Archive { .. } => catalog_for(path.path()).map(|catalog| catalog.items),
             }
             .map_err(|error| ui_text::catalog(language).open_failed(&path.to_string(), &error));
+            // The anchor must still be the catalogue item at its recorded index;
+            // otherwise the archive changed and the read below rejects it.
             let targets = siblings
                 .as_ref()
                 .ok()
                 .and_then(|siblings| {
-                    siblings.iter().position(|item| item == &path).map(|index| {
-                        navigation::pages(index, siblings.len(), mode)
-                            .into_iter()
-                            .map(|index| siblings[index].clone())
-                            .collect::<Vec<_>>()
-                    })
+                    let anchor = spread.first().and_then(|index| siblings.get(*index))?;
+                    (anchor == &path)
+                        .then(|| {
+                            spread
+                                .iter()
+                                .map(|index| siblings.get(*index).cloned())
+                                .collect::<Option<Vec<_>>>()
+                        })
+                        .flatten()
                 })
                 .unwrap_or_else(|| vec![path.clone()]);
             let selected = targets.first().cloned().unwrap_or_else(|| path.clone());
@@ -1105,6 +1130,9 @@ struct Oxeye {
     progress: ProgressStore,
     progress_dirty: bool,
     progress_due: Option<Instant>,
+    page_dimensions: HashMap<usize, (u32, u32)>,
+    page_overrides: BTreeMap<usize, PageOverride>,
+    layout_retry: Option<(SourceRef, Vec<usize>)>,
     prefetch: Prefetcher,
     loader: Loader,
     worker_tx: Sender<Completion>,
@@ -1208,6 +1236,9 @@ impl Oxeye {
             progress,
             progress_dirty: false,
             progress_due: None,
+            page_dimensions: HashMap::new(),
+            page_overrides: BTreeMap::new(),
+            layout_retry: None,
             prefetch,
             loader: Loader::default(),
             worker_tx,
@@ -1348,6 +1379,10 @@ impl Oxeye {
         if self.progress.record(&source).is_err() {
             return;
         }
+        self.schedule_progress_save(ctx);
+    }
+
+    fn schedule_progress_save(&mut self, ctx: &egui::Context) {
         self.progress_dirty = true;
         self.progress_due = Some(Instant::now() + PROGRESS_SAVE_DELAY);
         ctx.request_repaint_after(PROGRESS_SAVE_DELAY);
@@ -1438,9 +1473,8 @@ impl Oxeye {
 
     fn activate_setting(&mut self, ctx: &egui::Context) {
         match self.settings_control {
-            SETTING_PREVIEWS | SETTING_READING | SETTING_ARROW | SETTING_LANGUAGE => {
-                self.step_setting(self.settings_control, true)
-            }
+            SETTING_PREVIEWS | SETTING_READING | SETTING_AUTO_WIDE | SETTING_ARROW
+            | SETTING_LANGUAGE => self.step_setting(self.settings_control, true),
             SETTING_RESTORE => self.restore_settings(),
             SETTING_CANCEL => self.close_settings(ctx),
             SETTING_APPLY => self.apply_settings(ctx),
@@ -1454,6 +1488,7 @@ impl Oxeye {
         }
         let path = mode_target(&self.current_file, &self.selected, &self.displayed);
         self.settings.reading_mode = mode;
+        self.layout_retry = None;
         self.cancel_navigation();
         // Controllers stay paused until a successful commit replaces them.
         self.pause_animation();
@@ -1504,6 +1539,7 @@ impl Oxeye {
             return;
         }
         let mode_changed = reading_mode_changed(&self.settings, &draft);
+        let auto_wide_changed = self.settings.auto_wide != draft.auto_wide;
         let was_visible = self.settings.thumbnails_visible;
         let language = resolve_language(draft.language);
         self.settings = draft;
@@ -1513,12 +1549,57 @@ impl Oxeye {
             self.reveal_thumbnails();
             self.wake_thumbnails(ctx);
         }
-        if mode_changed {
+        if mode_changed || (auto_wide_changed && self.settings.reading_mode == ReadingMode::Book) {
             let _ = self.transition_to_mode(self.settings.reading_mode, ctx);
         } else {
             self.sync_prefetch(ctx);
         }
         self.persist_settings(ctx, self.text().applying_saving);
+    }
+
+    fn toggle_wide_page(&mut self, ctx: &egui::Context) {
+        if self.settings_draft.is_some() || self.close_state.requested {
+            return;
+        }
+        let Some(position) = self.position() else {
+            return;
+        };
+        let source = self.siblings[position].clone();
+        if self.reject_changed_archive(&source, ctx) {
+            return;
+        }
+        let mode = match self
+            .page_overrides
+            .get(&position)
+            .copied()
+            .unwrap_or_default()
+        {
+            PageOverride::Auto => PageOverride::Single,
+            PageOverride::Single => PageOverride::Spread,
+            PageOverride::Spread => PageOverride::Auto,
+        };
+        if mode == PageOverride::Auto {
+            self.page_overrides.remove(&position);
+        } else {
+            self.page_overrides.insert(position, mode);
+        }
+        let member = match &source {
+            SourceRef::Archive { index, .. } => *index,
+            SourceRef::File(_) => position,
+        };
+        if self.progress.warning.is_none()
+            && self.progress.set_override(&source, member, mode).is_ok()
+        {
+            self.schedule_progress_save(ctx);
+        }
+        self.layout_retry = None;
+        self.cancel_navigation();
+        if self.settings.reading_mode == ReadingMode::Book {
+            let _ = self.transition_to_mode(ReadingMode::Book, ctx);
+        } else {
+            self.sync_prefetch(ctx);
+            ctx.request_repaint();
+        }
     }
 
     fn toggle_previews(&mut self, ctx: &egui::Context) {
@@ -1721,12 +1802,15 @@ impl Oxeye {
         let Some(base) = source_index(self.selected.as_ref(), &self.navigation_paths) else {
             return;
         };
-        if self.navigation.enqueue(
-            action,
-            base,
-            self.navigation_paths.len(),
-            self.settings.reading_mode,
-        ) {
+        let length = self.navigation_paths.len();
+        let accepted = if self.settings.reading_mode == ReadingMode::Single {
+            self.navigation
+                .enqueue(action, base, length, ReadingMode::Single)
+        } else {
+            let layout = self.layout_for(length);
+            self.navigation.enqueue_with(action, base, layout.as_ref())
+        };
+        if accepted {
             self.pause_animation();
             self.start_navigation(ctx);
             self.sync_prefetch(ctx);
@@ -1742,13 +1826,11 @@ impl Oxeye {
             return;
         }
         while let Some(ticket) = self.navigation.start_next(self.loader.revision + 1) {
-            let path = navigation::pages(
-                ticket.index,
-                self.navigation_paths.len(),
-                self.settings.reading_mode,
-            )
-            .first()
-            .and_then(|index| self.navigation_paths.get(*index))
+            let path = {
+                let layout = self.layout_for(self.navigation_paths.len());
+                layout.anchor(ticket.index)
+            }
+            .and_then(|index| self.navigation_paths.get(index))
             .cloned();
             let Some(path) = path else {
                 self.navigation.failed(self.loader.revision + 1);
@@ -1795,6 +1877,73 @@ impl Oxeye {
             .iter()
             .map(|media| media.source.clone())
             .collect()
+    }
+
+    fn layout_for(&self, page_count: usize) -> Box<dyn PageLayout> {
+        if self.settings.reading_mode == ReadingMode::Book {
+            Box::new(comic_layout(
+                page_count,
+                &self.page_dimensions,
+                &self.page_overrides,
+                self.settings.auto_wide,
+            ))
+        } else {
+            Box::new(FixedLayout {
+                length: page_count,
+                mode: ReadingMode::Single,
+            })
+        }
+    }
+
+    fn layout(&self) -> Box<dyn PageLayout> {
+        self.layout_for(self.siblings.len())
+    }
+
+    /// Dimensions of the pages that were just committed, in display order.
+    fn record_page_dimensions(&mut self) {
+        for media in self.displayed_media() {
+            let Some(frame) = media.frames.first() else {
+                continue;
+            };
+            if let Some(index) = source_index(Some(&media.source), &self.siblings) {
+                self.page_dimensions
+                    .insert(index, frame.pixels.dimensions());
+            }
+        }
+    }
+
+    /// Cache-only hints around the current page; never probes or decodes.
+    fn fill_cached_dimensions(&mut self) {
+        let Some(current) = self.position() else {
+            return;
+        };
+        let start = current.saturating_sub(2);
+        let end = (current + 3).min(self.siblings.len());
+        for index in start..end {
+            if self.page_dimensions.contains_key(&index) {
+                continue;
+            }
+            if let Some(dimensions) = self.prefetch.cached_dimensions(&self.siblings[index]) {
+                self.page_dimensions.insert(index, dimensions);
+            }
+        }
+    }
+
+    /// The requested page's spread under the freshly learned dimensions, when
+    /// it differs from the spread that was just committed.
+    fn requested_layout_change(&self, layout: &ComicLayout) -> Option<(SourceRef, Vec<usize>)> {
+        let requested = self.current_file.clone()?;
+        let index = source_index(Some(&requested), &self.siblings)?;
+        debug_assert!(
+            layout.spread_count() >= 1,
+            "an existing catalogue item has at least one spread"
+        );
+        let pages = layout.pages(index);
+        let desired: Vec<_> = pages
+            .iter()
+            .filter_map(|index| self.siblings.get(*index).cloned())
+            .collect();
+        (!desired.is_empty() && desired != self.displayed_paths()).then_some((requested, pages))
     }
 
     fn displayed_tiles(&self) -> Vec<Arc<TiledFrame>> {
@@ -1880,6 +2029,9 @@ impl Oxeye {
         self.pause_animation();
         self.prefetch.set_allowed(false);
         self.thumb_offset = 0.;
+        self.page_dimensions.clear();
+        self.page_overrides.clear();
+        self.layout_retry = None;
         let result = catalog_for(&path)
             .and_then(|catalog| {
                 let file = SourceRef::file(&path);
@@ -1918,6 +2070,12 @@ impl Oxeye {
         match result {
             Ok((selected, siblings)) => {
                 self.siblings = siblings;
+                if selected.is_archive() {
+                    let overrides = self.progress.overrides_for(&selected);
+                    self.page_overrides = translate_overrides(overrides, &self.siblings);
+                } else {
+                    self.page_overrides = self.progress.overrides_for(&selected);
+                }
                 self.load(ctx, selected, false);
             }
             Err(error) => {
@@ -1939,6 +2097,9 @@ impl Oxeye {
         self.loader.cancel();
         self.candidate = None;
         self.loading_file = false;
+        self.page_dimensions.clear();
+        self.page_overrides.clear();
+        self.layout_retry = None;
         self.pause_animation();
         self.error = Some(
             self.text()
@@ -1956,7 +2117,24 @@ impl Oxeye {
         if !queued {
             self.cancel_navigation();
         }
-        let foreground = self.prefetch.foreground_requested_source(&path);
+        let (anchor_source, spread) = match source_index(Some(&path), &self.siblings) {
+            Some(index) => {
+                let layout = self.layout();
+                let anchor = layout.anchor(index).unwrap_or(index);
+                let mut spread = layout.pages(anchor);
+                if spread.is_empty() {
+                    spread.push(0);
+                }
+                let anchor_source = self
+                    .siblings
+                    .get(anchor)
+                    .cloned()
+                    .unwrap_or_else(|| path.clone());
+                (anchor_source, spread)
+            }
+            None => (path.clone(), vec![0]),
+        };
+        let foreground = self.prefetch.foreground_requested_source(&anchor_source);
         self.prefetch.set_allowed(false);
         self.rotation.cancel();
         // Keep the old clocks paused, not dropped: a failed load must remain recoverable.
@@ -1966,19 +2144,22 @@ impl Oxeye {
         self.animation_job = false;
         self.candidate = None;
         self.nav = None;
-        self.selected = Some(path.clone());
-        self.current_file = Some(path.clone());
+        self.selected = Some(anchor_source.clone());
+        // Keep the explicitly requested page for mode switches; only the
+        // selection and foreground token normalize to the spread anchor.
+        self.current_file = Some(path);
         self.update_prefetch_context();
         self.loading_file = true;
         if !queued {
             self.error = None;
         }
         self.loader.request(Work::Load(
-            path,
+            anchor_source,
             self.prefetch.clone(),
             foreground,
             self.tile_cap(ctx),
             self.settings.reading_mode,
+            spread,
             self.language,
         ));
         self.start_work(ctx);
@@ -2025,8 +2206,18 @@ impl Oxeye {
                 if let Some((path, siblings)) = done.result.selection {
                     self.selected = Some(path.clone());
                     match siblings {
-                        Ok(paths) => self.siblings = paths,
+                        Ok(paths) => {
+                            if paths != self.siblings {
+                                self.page_dimensions.clear();
+                                self.page_overrides.clear();
+                                self.layout_retry = None;
+                            }
+                            self.siblings = paths;
+                        }
                         Err(error) => {
+                            self.page_dimensions.clear();
+                            self.page_overrides.clear();
+                            self.layout_retry = None;
                             self.siblings = vec![path];
                             self.error = Some(error);
                         }
@@ -2155,12 +2346,49 @@ impl Oxeye {
         self.other_pages = prepared.others;
         self.media = Some(prepared.media);
         self.tiled = Some(prepared.tiled);
+        let previous_retry = self.layout_retry.take();
+        self.record_page_dimensions();
+        self.fill_cached_dimensions();
         // Record the committed page before navigation_painted starts a queued
         // load, which replaces `selected` with the next, not-yet-shown page.
         if loaded {
             self.record_progress(ctx);
         }
-        self.navigation_painted(candidate.revision, ctx);
+        let correction = if loaded
+            && self.display_mode == ReadingMode::Book
+            && self.settings.reading_mode == ReadingMode::Book
+            && !self.close_state.requested
+        {
+            let layout = comic_layout(
+                self.siblings.len(),
+                &self.page_dimensions,
+                &self.page_overrides,
+                self.settings.auto_wide,
+            );
+            self.requested_layout_change(&layout)
+                .filter(|retry| Some(retry) != previous_retry.as_ref())
+                .map(|(source, pages)| (source, pages, layout))
+        } else {
+            None
+        };
+        match correction {
+            Some((source, pages, layout)) => {
+                // The wrong spread did paint; settle its navigation barrier so
+                // a queued step can resume after the corrected reload.
+                if let Some(ticket) = self.navigation.painted(candidate.revision) {
+                    self.navigation.crossed_frame(ticket);
+                }
+                self.navigation.retarget(pages[0], &layout);
+                let revision = self.loader.revision;
+                self.load(ctx, source.clone(), true);
+                if self.loader.revision != revision {
+                    self.layout_retry = Some((source, pages));
+                } else {
+                    self.navigation_painted(candidate.revision, ctx);
+                }
+            }
+            None => self.navigation_painted(candidate.revision, ctx),
+        }
         if loaded {
             self.reveal_thumbnails();
         }
@@ -2362,12 +2590,20 @@ impl Oxeye {
     }
 
     fn edge(&mut self, last: bool, ctx: &egui::Context) {
-        let path = if last {
-            self.siblings.last()
+        let index = if self.settings.reading_mode == ReadingMode::Book {
+            let layout = comic_layout(
+                self.siblings.len(),
+                &self.page_dimensions,
+                &self.page_overrides,
+                self.settings.auto_wide,
+            );
+            if last { layout.last() } else { layout.first() }
         } else {
-            self.siblings.first()
+            let layout = self.layout();
+            let count = layout.length();
+            (count > 0).then(|| if last { count - 1 } else { 0 })
         };
-        if let Some(path) = path.cloned() {
+        if let Some(path) = index.and_then(|index| self.siblings.get(index)).cloned() {
             self.load(ctx, path, false);
         }
     }
@@ -2536,6 +2772,7 @@ impl Oxeye {
             Action::Close => self.request_close(ctx),
             Action::Settings => self.open_settings(ctx),
             Action::ToggleMode => self.toggle_reading_mode(ctx),
+            Action::WideToggle => self.toggle_wide_page(ctx),
         }
     }
 
@@ -2666,16 +2903,12 @@ impl Oxeye {
         let index = if self.settings.reading_mode == ReadingMode::Single {
             adjacent_index(index, self.siblings.len(), next)?
         } else {
-            navigation::destination(
-                index,
-                self.siblings.len(),
-                self.settings.reading_mode,
-                if next {
-                    Navigation::Next
-                } else {
-                    Navigation::Previous
-                },
-            )?
+            let action = if next {
+                Navigation::Next
+            } else {
+                Navigation::Previous
+            };
+            self.layout().destination(index, action)?
         };
         self.siblings.get(index).cloned()
     }
@@ -2696,8 +2929,7 @@ impl Oxeye {
     fn position_label(&self) -> String {
         self.position()
             .map(|index| {
-                let pages =
-                    navigation::pages(index, self.siblings.len(), self.settings.reading_mode);
+                let pages = self.layout().pages(index);
                 if let Some(last) = pages.last().filter(|last| **last != index) {
                     format!("{}–{} / {}", index + 1, last + 1, self.siblings.len())
                 } else {
@@ -3211,6 +3443,59 @@ impl Oxeye {
                         if reading_toggle {
                             draft.reading_mode = toggled_reading_mode(draft.reading_mode);
                         }
+                        let mut wide_toggle = false;
+                        EguiFrame::new()
+                            .fill(if control == SETTING_AUTO_WIDE {
+                                palette.accent_bg
+                            } else {
+                                palette.canvas
+                            })
+                            .stroke(Stroke::new(
+                                1.,
+                                if control == SETTING_AUTO_WIDE {
+                                    palette.accent
+                                } else {
+                                    palette.border
+                                },
+                            ))
+                            .corner_radius(6.)
+                            .inner_margin(Margin::symmetric(9, 6))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add(
+                                            egui::Label::new(
+                                                RichText::new(text.wide_pages)
+                                                    .size(13.)
+                                                    .color(palette.text),
+                                            )
+                                            .sense(Sense::click()),
+                                        )
+                                        .on_hover_text(text.auto_wide_tooltip)
+                                        .clicked()
+                                    {
+                                        wide_toggle = true;
+                                    }
+                                    if action_button(
+                                        ui,
+                                        if draft.auto_wide {
+                                            text.auto_wide_auto
+                                        } else {
+                                            text.auto_wide_off
+                                        },
+                                        true,
+                                        draft.auto_wide,
+                                        palette,
+                                        text.auto_wide_tooltip,
+                                    ) {
+                                        wide_toggle = true;
+                                    }
+                                });
+                            });
+                        if wide_toggle {
+                            control = SETTING_AUTO_WIDE;
+                            draft.auto_wide = !draft.auto_wide;
+                        }
                         let mut arrow_toggle = false;
                         EguiFrame::new()
                             .fill(if control == SETTING_ARROW {
@@ -3493,6 +3778,12 @@ impl Oxeye {
         let stats = self.cache_stats;
         let queued = self.navigation.pending_len();
         let viewport = self.viewport;
+        let wide = self.position().map(|position| {
+            self.page_overrides
+                .get(&position)
+                .copied()
+                .unwrap_or_default()
+        });
         egui::Panel::bottom("footer")
             .frame(panel_frame(palette))
             .show(ui, |ui| {
@@ -3504,6 +3795,18 @@ impl Oxeye {
                         self.enqueue_navigation(Navigation::Next, ui.ctx());
                     }
                     ui.label(RichText::new(position).size(11.).color(palette.muted));
+                    if let Some(mode) = wide
+                        && action_button(
+                            ui,
+                            text.wide_label(mode),
+                            true,
+                            mode != PageOverride::Auto,
+                            palette,
+                            text.wide_tooltip,
+                        )
+                    {
+                        self.toggle_wide_page(ui.ctx());
+                    }
                     ui.separator();
                     if action_button(ui, "-", has_image, false, palette, text.zoom_out_tooltip) {
                         self.zoom_by(0.8, None, viewport, ui.ctx());
@@ -3839,6 +4142,7 @@ impl eframe::App for Oxeye {
         }
         self.poll_workers(ctx);
         self.advance_frames(ctx);
+        self.fill_cached_dimensions();
         self.tick(ctx);
         self.sync_prefetch(ctx);
         self.poll_thumbnails(ctx);
@@ -3901,6 +4205,15 @@ mod tests {
     }
 
     fn requested_source_work(path: SourceRef, prefetch: &Prefetcher, mode: ReadingMode) -> Work {
+        requested_source_work_spread(path, prefetch, mode, vec![0])
+    }
+
+    fn requested_source_work_spread(
+        path: SourceRef,
+        prefetch: &Prefetcher,
+        mode: ReadingMode,
+        spread: Vec<usize>,
+    ) -> Work {
         let foreground = prefetch.foreground_requested_source(&path);
         Work::Load(
             path,
@@ -3908,6 +4221,7 @@ mod tests {
             foreground,
             MAX_TILE,
             mode,
+            spread,
             Language::English,
         )
     }
@@ -3977,8 +4291,12 @@ mod tests {
     }
 
     fn png_bytes(color: u8) -> Vec<u8> {
+        png_of(2, 3, color)
+    }
+
+    fn png_of(width: u32, height: u32, color: u8) -> Vec<u8> {
         let mut bytes = std::io::Cursor::new(Vec::new());
-        RgbaImage::from_pixel(2, 3, image::Rgba([color, 20, 30, 255]))
+        RgbaImage::from_pixel(width, height, image::Rgba([color, 20, 30, 255]))
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
         bytes.into_inner()
@@ -4340,6 +4658,666 @@ mod tests {
     }
 
     #[test]
+    fn book_layout_uses_known_dimensions_for_spreads_and_anchors() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = test_app();
+        app.siblings = (0..6)
+            .map(|index| SourceRef::file(&directory.path().join(format!("{index}.png"))))
+            .collect();
+        app.settings.reading_mode = ReadingMode::Book;
+        app.page_dimensions = HashMap::from([(0, (400, 100)), (2, (400, 100))]);
+        let layout = app.layout();
+        assert_eq!(layout.pages(0), [0], "cover stays single even when wide");
+        assert_eq!(
+            layout.pages(1),
+            [1],
+            "a wide next page cannot be a left page"
+        );
+        assert_eq!(layout.pages(2), [2]);
+        assert_eq!(layout.pages(3), [3, 4]);
+        assert_eq!(layout.anchor(4), Some(3));
+        assert_eq!(layout.destination(0, Navigation::Next), Some(1));
+        assert_eq!(layout.destination(1, Navigation::Next), Some(2));
+        assert_eq!(layout.destination(2, Navigation::Next), Some(3));
+        assert_eq!(layout.destination(3, Navigation::Next), Some(5));
+    }
+
+    #[test]
+    fn queued_navigation_targets_dynamic_spread_anchors() {
+        let directory = tempfile::tempdir().unwrap();
+        let sources: Vec<_> = (0..6)
+            .map(|index| {
+                let path = directory.path().join(format!("{index}.png"));
+                std::fs::write(&path, png_bytes(index as u8 + 1)).unwrap();
+                SourceRef::file(&path)
+            })
+            .collect();
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        app.siblings = sources.clone();
+        app.settings.reading_mode = ReadingMode::Book;
+        app.page_dimensions = HashMap::from([(2, (400, 100))]);
+        app.selected = Some(sources[0].clone());
+        // Keep the loader busy so enqueueing does not start a real decode.
+        app.loader
+            .request(load_work(directory.path().join("blocked.png")));
+        app.enqueue_navigation(Navigation::Next, &ctx);
+        app.enqueue_navigation(Navigation::Next, &ctx);
+        assert_eq!(app.navigation_paths, sources);
+        let first = app.navigation.start_next(10).unwrap();
+        assert_eq!(first.index, 1);
+        app.navigation.failed(10);
+        let second = app.navigation.start_next(11).unwrap();
+        assert_eq!(second.index, 2, "a wide page is its own anchor");
+    }
+
+    #[test]
+    fn book_load_uses_dynamic_spread_pages_in_reading_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        let pages: Vec<_> = (0..6)
+            .map(|index| (format!("p{index}.png"), png_bytes(index as u8 + 1)))
+            .collect();
+        let entries: Vec<_> = pages
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        model::source::test_support::write_zip(&archive, &entries);
+        let ctx = egui::Context::default();
+        let mut app = test_app_at(&directory.path().join("progress.json"));
+        app.settings.reading_mode = ReadingMode::Book;
+        app.open_path(archive, &ctx);
+        let sources = app.siblings.clone();
+        finish_load(&mut app, &ctx);
+        app.page_dimensions.insert(2, (400, 100));
+        app.load(&ctx, sources[4].clone(), false);
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.selected, Some(sources[3].clone()));
+        assert_eq!(
+            app.displayed_paths(),
+            vec![sources[3].clone(), sources[4].clone()]
+        );
+        assert_eq!(app.position_label(), "4–5 / 6");
+    }
+
+    #[test]
+    fn cached_prefetch_dimensions_fill_neighbors_without_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let sources: Vec<_> = (0..5)
+            .map(|index| {
+                let path = directory.path().join(format!("{index}.png"));
+                std::fs::write(&path, png_bytes(index as u8 + 1)).unwrap();
+                SourceRef::file(&path)
+            })
+            .collect();
+        let mut app = test_app();
+        app.siblings = sources.clone();
+        app.settings.reading_mode = ReadingMode::Single;
+        app.selected = Some(sources[2].clone());
+        app.page_dimensions.clear();
+        app.prefetch.update_context_many_sources(
+            app.siblings.clone(),
+            app.selected.clone(),
+            Vec::new(),
+        );
+        app.prefetch.set_allowed(true);
+        wait_until(|| app.prefetch.cached_dimensions(&sources[3]).is_some());
+        app.prefetch.set_allowed(false);
+        app.fill_cached_dimensions();
+        assert_eq!(app.page_dimensions.get(&3), Some(&(2, 3)));
+        assert!(
+            !app.page_dimensions.contains_key(&0),
+            "pages outside the cached neighborhood are not probed"
+        );
+    }
+
+    #[test]
+    fn auto_wide_correction_reloads_once_and_does_not_loop() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        let normal = png_bytes(1);
+        let wide = png_of(4, 1, 2);
+        model::source::test_support::write_zip(
+            &archive,
+            &[
+                ("p0.png", &normal),
+                ("p1.png", &wide),
+                ("p2.png", &normal),
+                ("p3.png", &normal),
+            ],
+        );
+        let ctx = egui::Context::default();
+        let mut app = test_app_at(&directory.path().join("progress.json"));
+        app.settings.reading_mode = ReadingMode::Book;
+        app.open_path(archive, &ctx);
+        let sources = app.siblings.clone();
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.displayed_paths(), vec![sources[0].clone()]);
+
+        app.load(&ctx, sources[1].clone(), false);
+        finish_load(&mut app, &ctx);
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.displayed_paths(), vec![sources[1].clone()]);
+        assert_eq!(app.selected, Some(sources[1].clone()));
+        assert!(app.other_pages.is_empty());
+        assert!(app.layout_retry.is_none());
+        assert!(
+            app.page_dimensions
+                .get(&1)
+                .is_some_and(|&(width, height)| is_wide(width, height))
+        );
+        assert!(!app.loader.running && app.loader.pending.is_none());
+    }
+
+    #[test]
+    fn wide_left_page_correction_keeps_the_requested_page_before_advancing() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        let normal = png_bytes(1);
+        let wide = png_of(4, 1, 2);
+        model::source::test_support::write_zip(
+            &archive,
+            &[("p0.png", &normal), ("p1.png", &normal), ("p2.png", &wide)],
+        );
+        let ctx = egui::Context::default();
+        let mut app = test_app_at(&directory.path().join("progress.json"));
+        app.settings.reading_mode = ReadingMode::Book;
+        app.open_path(archive, &ctx);
+        let sources = app.siblings.clone();
+        finish_load(&mut app, &ctx);
+
+        // Next requests page 1, which unknowingly forms [1, 2] with the wide page.
+        app.perform(Action::Next, Rect::NOTHING, &ctx);
+        finish_load(&mut app, &ctx);
+        finish_load(&mut app, &ctx);
+        assert_eq!(
+            app.displayed_paths(),
+            vec![sources[1].clone()],
+            "the requested portrait page must display, not the wide page"
+        );
+        assert_eq!(app.selected, Some(sources[1].clone()));
+        assert_eq!(app.position_label(), "2 / 3");
+        assert!(app.layout_retry.is_none());
+
+        // Only now does the wide page become its own spread.
+        app.perform(Action::Next, Rect::NOTHING, &ctx);
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.displayed_paths(), vec![sources[2].clone()]);
+        assert!(app.other_pages.is_empty());
+    }
+
+    #[test]
+    fn auto_wide_correction_retargets_queued_next_to_the_new_single_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        let normal = png_bytes(1);
+        let wide = png_of(4, 1, 2);
+        model::source::test_support::write_zip(
+            &archive,
+            &[
+                ("p0.png", &normal),
+                ("p1.png", &normal),
+                ("p2.png", &wide),
+                ("p3.png", &normal),
+            ],
+        );
+        let ctx = egui::Context::default();
+        let mut app = test_app_at(&directory.path().join("progress.json"));
+        app.settings.reading_mode = ReadingMode::Book;
+        app.settings.prefetch.memory_mib = 0;
+        app.prefetch.configure(app.settings.prefetch.clone());
+        app.open_path(archive, &ctx);
+        finish_load(&mut app, &ctx);
+        let sources = app.siblings.clone();
+        assert!(!app.page_dimensions.contains_key(&2));
+
+        app.perform(Action::Next, Rect::NOTHING, &ctx);
+        app.perform(Action::Next, Rect::NOTHING, &ctx);
+        assert_eq!(app.navigation.pending_len(), 1);
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.displayed_paths(), sources[1..3]);
+        assert_eq!(app.layout_retry, Some((sources[1].clone(), vec![1])));
+        finish_load(&mut app, &ctx);
+        assert_eq!(
+            app.displayed_paths(),
+            vec![sources[1].clone()],
+            "the corrected portrait page must commit before the queued Next"
+        );
+        assert_eq!(
+            app.current_file,
+            Some(sources[2].clone()),
+            "queued Next must target the newly single wide page, not page 3"
+        );
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.displayed_paths(), vec![sources[2].clone()]);
+        assert!(app.navigation.is_idle());
+        assert!(app.layout_retry.is_none());
+        assert!(!app.loader.running && app.loader.pending.is_none());
+    }
+
+    #[test]
+    fn cascading_wide_discovery_retries_changed_spreads_for_the_same_source_then_stops() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        let normal = png_bytes(1);
+        let wide = png_of(4, 1, 2);
+        model::source::test_support::write_zip(
+            &archive,
+            &[
+                ("p0.png", &normal),
+                ("p1.png", &normal),
+                ("p2.png", &normal),
+                ("p3.png", &wide),
+                ("p4.png", &normal),
+                ("p5.png", &wide),
+                ("p6.png", &normal),
+            ],
+        );
+        let ctx = egui::Context::default();
+        let mut app = test_app_at(&directory.path().join("progress.json"));
+        app.settings.reading_mode = ReadingMode::Book;
+        app.settings.prefetch.memory_mib = 0;
+        app.prefetch.configure(app.settings.prefetch.clone());
+        app.open_path(archive, &ctx);
+        finish_load(&mut app, &ctx);
+        let sources = app.siblings.clone();
+        let revision = app.loader.revision;
+        app.load(&ctx, sources[4].clone(), false);
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.displayed_paths(), sources[3..5]);
+        assert_eq!(app.layout_retry, Some((sources[4].clone(), vec![4, 5])));
+        assert!(!app.page_dimensions.contains_key(&5));
+
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.displayed_paths(), sources[4..6]);
+        assert_eq!(
+            app.layout_retry,
+            Some((sources[4].clone(), vec![4])),
+            "learning page 5 is wide must allow a second correction of page 4"
+        );
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.displayed_paths(), vec![sources[4].clone()]);
+        assert_eq!(app.current_file, Some(sources[4].clone()));
+        assert_eq!(
+            app.loader.revision,
+            revision + 3,
+            "exactly two corrective reloads"
+        );
+        assert!(app.layout_retry.is_none());
+        assert!(app.navigation.is_idle());
+        for _ in 0..3 {
+            app.poll_workers(&ctx);
+            app.advance_frames(&ctx);
+        }
+        assert_eq!(app.loader.revision, revision + 3);
+        assert!(!app.loader.running && app.loader.pending.is_none());
+    }
+
+    #[test]
+    fn archive_overrides_translate_member_indices_to_sorted_positions() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        let first = png_bytes(1);
+        let second = png_bytes(2);
+        let tenth = png_bytes(10);
+        let twentieth = png_bytes(20);
+        model::source::test_support::write_zip(
+            &archive,
+            &[
+                ("page10.png", &tenth),     // member 0
+                ("page1.png", &first),      // member 1
+                ("readme.txt", b"note"),    // member 2
+                ("page2.png", &second),     // member 3
+                ("page20.png", &twentieth), // member 4
+            ],
+        );
+        let sources = catalog_for(&archive).unwrap().items;
+        assert_eq!(
+            sources
+                .iter()
+                .map(SourceRef::display_name)
+                .collect::<Vec<_>>(),
+            ["page1.png", "page2.png", "page10.png", "page20.png"]
+        );
+        let progress = directory.path().join("progress.json");
+        let mut store = ProgressStore::load_from(&progress);
+        store
+            .set_override(&sources[0], 3, PageOverride::Single)
+            .unwrap();
+        store.save().unwrap();
+
+        let ctx = egui::Context::default();
+        let mut app = test_app_at(&progress);
+        app.settings.reading_mode = ReadingMode::Book;
+        app.open_path(archive, &ctx);
+        finish_load(&mut app, &ctx);
+        assert_eq!(
+            app.page_overrides,
+            BTreeMap::from([(1, PageOverride::Single)]),
+            "member index 3 is page2 at sorted position 1"
+        );
+        let layout = app.layout();
+        assert_eq!(layout.pages(1), [1], "page2 is single");
+        assert_eq!(layout.pages(2), [2, 3], "page10 and page20 stay paired");
+    }
+
+    #[test]
+    fn wide_shortcut_requires_plain_w_and_does_not_repeat() {
+        assert_eq!(
+            key_action(Key::W, Modifiers::NONE),
+            Some(Action::WideToggle)
+        );
+        for modifiers in [Modifiers::SHIFT, Modifiers::ALT, Modifiers::CTRL] {
+            assert_eq!(key_action(Key::W, modifiers), None);
+        }
+        assert_eq!(key_action(Key::W, Modifiers::COMMAND), Some(Action::Close));
+        assert!(!action_allows_repeat(Action::WideToggle));
+        assert_eq!(settings_key_action(Key::W, Modifiers::NONE), None);
+    }
+
+    #[test]
+    fn wide_toggle_cycles_persists_member_indices_and_restores_the_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        let page = png_bytes(1);
+        model::source::test_support::write_zip(
+            &archive,
+            &[
+                ("page10.png", &page),
+                ("page1.png", &page),
+                ("readme.txt", b"note"),
+                ("page2.png", &page),
+                ("page20.png", &page),
+            ],
+        );
+        let progress = directory.path().join("progress.json");
+        let ctx = egui::Context::default();
+        let mut app = test_app_at(&progress);
+        app.open_path(archive.clone(), &ctx);
+        finish_load(&mut app, &ctx);
+        let sources = app.siblings.clone();
+        app.load(&ctx, sources[1].clone(), false);
+        finish_load(&mut app, &ctx);
+        app.flush_progress(&ctx, true).unwrap();
+        let bookmark = app.progress.restore(&sources[1]);
+        let revision = app.loader.revision;
+        for mode in [
+            PageOverride::Single,
+            PageOverride::Spread,
+            PageOverride::Auto,
+            PageOverride::Single,
+        ] {
+            app.perform(Action::WideToggle, Rect::NOTHING, &ctx);
+            assert_eq!(
+                app.page_overrides.get(&1).copied().unwrap_or_default(),
+                mode
+            );
+            let expected = if mode == PageOverride::Auto {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([(3, mode)])
+            };
+            assert_eq!(app.progress.overrides_for(&sources[1]), expected);
+            assert_eq!(
+                app.progress.restore(&sources[1]),
+                bookmark,
+                "W must not move the bookmark"
+            );
+            assert!(app.progress_dirty && app.progress_due.is_some());
+            app.flush_progress(&ctx, false).unwrap();
+            assert!(
+                app.progress_dirty,
+                "override saves use the progress debounce"
+            );
+            app.flush_progress(&ctx, true).unwrap();
+            assert_eq!(
+                ProgressStore::load_from(&progress).overrides_for(&sources[1]),
+                expected
+            );
+        }
+        assert_eq!(app.settings.reading_mode, ReadingMode::Single);
+        assert_eq!(app.loader.revision, revision, "Single W never reloads");
+
+        let mut reopened = test_app_at(&progress);
+        reopened.settings.reading_mode = ReadingMode::Book;
+        reopened.open_path(archive, &ctx);
+        finish_load(&mut reopened, &ctx);
+        assert_eq!(
+            reopened.page_overrides,
+            BTreeMap::from([(1, PageOverride::Single)])
+        );
+        assert_eq!(reopened.displayed_paths(), vec![sources[1].clone()]);
+        assert_eq!(reopened.layout().pages(2), [2, 3]);
+    }
+
+    #[test]
+    fn wide_toggle_reloads_requested_spread_clears_queue_and_resets_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        let page = png_bytes(1);
+        model::source::test_support::write_zip(
+            &archive,
+            &[
+                ("p0.png", &page),
+                ("p1.png", &page),
+                ("p2.png", &page),
+                ("p3.png", &page),
+            ],
+        );
+        let ctx = egui::Context::default();
+        let mut app = test_app_at(&directory.path().join("progress.json"));
+        app.settings.reading_mode = ReadingMode::Book;
+        app.open_path(archive, &ctx);
+        finish_load(&mut app, &ctx);
+        let sources = app.siblings.clone();
+        app.load(&ctx, sources[2].clone(), false);
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.selected, Some(sources[1].clone()));
+        app.navigation_paths = sources.clone();
+        assert!(
+            app.navigation
+                .enqueue(Navigation::Next, 1, 4, ReadingMode::Book)
+        );
+        app.layout_retry = Some((sources[2].clone(), vec![1, 2]));
+        let revision = app.loader.revision;
+        app.perform(Action::WideToggle, Rect::NOTHING, &ctx);
+        assert!(app.loader.revision > revision);
+        assert!(app.navigation.is_idle() && app.navigation_paths.is_empty());
+        assert!(app.layout_retry.is_none());
+        assert_eq!(
+            app.page_overrides,
+            BTreeMap::from([(1, PageOverride::Single)])
+        );
+        assert_eq!(app.current_file, Some(sources[2].clone()));
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.displayed_paths(), sources[2..]);
+        assert!(app.navigation.is_idle());
+        assert!(app.layout_retry.is_none());
+    }
+
+    #[test]
+    fn book_wide_toggle_cycles_single_spread_auto_through_real_reloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        let normal = png_bytes(1);
+        let wide = png_of(4, 1, 2);
+        model::source::test_support::write_zip(
+            &archive,
+            &[("p0.png", &normal), ("p1.png", &wide), ("p2.png", &normal)],
+        );
+        let ctx = egui::Context::default();
+        let mut app = test_app_at(&directory.path().join("progress.json"));
+        app.settings.reading_mode = ReadingMode::Book;
+        app.open_path(archive, &ctx);
+        finish_load(&mut app, &ctx);
+        let sources = app.siblings.clone();
+        app.page_dimensions.insert(1, (4, 1));
+        app.load(&ctx, sources[1].clone(), false);
+        finish_load(&mut app, &ctx);
+        for (mode, pages) in [
+            (PageOverride::Single, vec![sources[1].clone()]),
+            (PageOverride::Spread, sources[1..].to_vec()),
+            (PageOverride::Auto, vec![sources[1].clone()]),
+        ] {
+            app.perform(Action::WideToggle, Rect::NOTHING, &ctx);
+            finish_load(&mut app, &ctx);
+            assert_eq!(app.displayed_paths(), pages);
+            assert_eq!(
+                app.page_overrides.get(&1).copied().unwrap_or_default(),
+                mode
+            );
+            assert_eq!(app.current_file, Some(sources[1].clone()));
+            assert!(app.layout_retry.is_none());
+            assert!(!app.loader.running && app.loader.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn single_wide_toggle_persists_file_position_without_reloading_or_changing_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("1.png");
+        let second = directory.path().join("2.png");
+        std::fs::write(&first, png_bytes(1)).unwrap();
+        std::fs::write(&second, png_of(4, 1, 2)).unwrap();
+        let progress = directory.path().join("progress.json");
+        let ctx = egui::Context::default();
+        let mut app = test_app_at(&progress);
+        app.open_path(second.clone(), &ctx);
+        finish_load(&mut app, &ctx);
+        let revision = app.loader.revision;
+        let media = app.media.clone().unwrap();
+        app.navigation_paths = app.siblings.clone();
+        assert!(
+            app.navigation
+                .enqueue(Navigation::Previous, 1, 2, ReadingMode::Single)
+        );
+        app.perform(Action::WideToggle, Rect::NOTHING, &ctx);
+        assert_eq!(app.settings.reading_mode, ReadingMode::Single);
+        assert_eq!(app.loader.revision, revision);
+        assert!(Arc::ptr_eq(app.media.as_ref().unwrap(), &media));
+        assert_eq!(app.layout().pages(1), [1]);
+        assert!(app.navigation.is_idle() && app.navigation_paths.is_empty());
+        app.request_close(&ctx);
+        assert!(!app.progress_dirty, "close flushes the override");
+        assert_eq!(
+            ProgressStore::load_from(&progress).overrides_for(&SourceRef::file(&second)),
+            BTreeMap::from([(1, PageOverride::Single)]),
+        );
+        let mut reopened = test_app_at(&progress);
+        reopened.open_path(second, &ctx);
+        finish_load(&mut reopened, &ctx);
+        assert_eq!(
+            reopened.page_overrides,
+            BTreeMap::from([(1, PageOverride::Single)])
+        );
+    }
+
+    #[test]
+    fn apply_auto_wide_reloads_book_only_and_unrelated_settings_do_not_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        let normal = png_bytes(1);
+        let wide = png_of(4, 1, 2);
+        model::source::test_support::write_zip(
+            &archive,
+            &[("p0.png", &normal), ("p1.png", &wide), ("p2.png", &wide)],
+        );
+        let ctx = egui::Context::default();
+        let mut app = test_app_at(&directory.path().join("progress.json"));
+        app.settings.reading_mode = ReadingMode::Book;
+        // Keep saves queued so the test never writes the user's settings.
+        assert!(app.saves.lock().unwrap().request(0, app.settings.clone()));
+        app.open_path(archive, &ctx);
+        finish_load(&mut app, &ctx);
+        let sources = app.siblings.clone();
+        app.page_dimensions.extend([(1, (4, 1)), (2, (4, 1))]);
+        app.load(&ctx, sources[1].clone(), false);
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.displayed_paths(), vec![sources[1].clone()]);
+
+        let revision = app.loader.revision;
+        app.open_settings(&ctx);
+        let draft = app.settings_draft.as_mut().unwrap();
+        draft.language = Language::Japanese;
+        draft.prefetch.before = 0;
+        draft.thumbnails_visible = false;
+        draft.comic_arrow_direction = ComicArrowDirection::LeftNext;
+        app.apply_settings(&ctx);
+        assert_eq!(app.loader.revision, revision);
+        assert_eq!(app.displayed_paths(), vec![sources[1].clone()]);
+
+        app.open_settings(&ctx);
+        app.settings_control = SETTING_AUTO_WIDE;
+        app.activate_setting(&ctx);
+        assert!(!app.settings_draft.as_ref().unwrap().auto_wide);
+        assert!(app.settings.auto_wide, "the row edits only the draft");
+        app.layout_retry = Some((sources[1].clone(), vec![1]));
+        app.apply_settings(&ctx);
+        assert!(app.loader.revision > revision);
+        assert!(app.layout_retry.is_none());
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.displayed_paths(), sources[1..], "Off pairs wide pages");
+
+        app.open_settings(&ctx);
+        app.step_setting(SETTING_AUTO_WIDE, false);
+        app.apply_settings(&ctx);
+        finish_load(&mut app, &ctx);
+        assert_eq!(
+            app.displayed_paths(),
+            vec![sources[1].clone()],
+            "Auto singles wide pages"
+        );
+
+        assert!(app.transition_to_mode(ReadingMode::Single, &ctx));
+        finish_load(&mut app, &ctx);
+        let revision = app.loader.revision;
+        app.open_settings(&ctx);
+        app.step_setting(SETTING_AUTO_WIDE, true);
+        app.apply_settings(&ctx);
+        assert_eq!(app.loader.revision, revision, "auto-wide is Book-only");
+        assert!(!app.settings.auto_wide);
+    }
+
+    #[test]
+    fn mode_switch_keeps_the_explicitly_requested_spread_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("comic.cbz");
+        let page = png_bytes(1);
+        model::source::test_support::write_zip(
+            &archive,
+            &[
+                ("p0.png", &page),
+                ("p1.png", &page),
+                ("p2.png", &page),
+                ("p3.png", &page),
+            ],
+        );
+        let ctx = egui::Context::default();
+        let mut app = test_app_at(&directory.path().join("progress.json"));
+        app.settings.reading_mode = ReadingMode::Book;
+        app.open_path(archive, &ctx);
+        let sources = app.siblings.clone();
+        finish_load(&mut app, &ctx);
+
+        // Request the left page of the first pair; the anchor is page 1.
+        app.load(&ctx, sources[2].clone(), false);
+        finish_load(&mut app, &ctx);
+        assert_eq!(
+            app.displayed_paths(),
+            vec![sources[1].clone(), sources[2].clone()]
+        );
+        assert_eq!(app.selected, Some(sources[1].clone()));
+        assert_eq!(app.current_file, Some(sources[2].clone()));
+
+        assert!(app.transition_to_mode(ReadingMode::Single, &ctx));
+        finish_load(&mut app, &ctx);
+        assert_eq!(app.selected, Some(sources[2].clone()));
+        assert_eq!(app.displayed_paths(), vec![sources[2].clone()]);
+        assert!(!app.loader.running && app.loader.pending.is_none());
+        assert!(app.layout_retry.is_none());
+    }
+
+    #[test]
     fn folder_open_keeps_selected_file_siblings_previews_and_copy() {
         let directory = tempfile::tempdir().unwrap();
         let first = directory.path().join("1.png");
@@ -4500,6 +5478,8 @@ mod tests {
             } else {
                 None
             };
+            app.page_dimensions = HashMap::from([(0, (400, 100)), (2, (400, 100))]);
+            app.page_overrides = BTreeMap::from([(2, PageOverride::Single)]);
             let changed = png_bytes(88);
             model::source::test_support::write_zip(
                 &archive,
@@ -4528,6 +5508,25 @@ mod tests {
                     .contains(app.text().archive_changed)
             );
             assert!(Arc::ptr_eq(app.media.as_ref().unwrap(), &previous));
+            assert!(
+                app.page_dimensions.is_empty(),
+                "old archive dimensions must not survive a catalogue change"
+            );
+            assert!(app.page_overrides.is_empty());
+            if worker_started {
+                // The replacement catalogue was installed despite the old
+                // source failing, so fresh indices can be navigated directly.
+                let fresh = app.siblings.clone();
+                assert_eq!(fresh.len(), 1);
+                app.load(&ctx, fresh[0].clone(), false);
+                finish_load(&mut app, &ctx);
+                assert_eq!(app.displayed_paths(), vec![fresh[0].clone()]);
+            } else {
+                app.open_path(archive.clone(), &ctx);
+                finish_load(&mut app, &ctx);
+                assert_eq!(app.siblings.len(), 1);
+                assert_eq!(app.displayed_paths(), vec![app.siblings[0].clone()]);
+            }
         }
     }
 
@@ -4812,7 +5811,7 @@ mod tests {
         assert!(!loader.finish(first));
         let (latest, work, _) = loader.take().unwrap();
         assert!(
-            matches!(work, Work::Load(path, _, _, _, _, _) if path == SourceRef::file(Path::new("third.png")))
+            matches!(work, Work::Load(path, _, _, _, _, _, _) if path == SourceRef::file(Path::new("third.png")))
         );
         assert!(loader.finish(latest));
         assert!(loader.take().is_none());
@@ -4858,6 +5857,7 @@ mod tests {
                 foreground,
                 MAX_TILE,
                 ReadingMode::Single,
+                vec![index],
                 Language::English,
             ));
             let (revision, work, cancelled) = loader.take().unwrap();
@@ -5000,6 +6000,7 @@ mod tests {
             },
             thumbnails_visible: false,
             reading_mode: settings::ReadingMode::Book,
+            auto_wide: false,
             comic_arrow_direction: settings::ComicArrowDirection::LeftNext,
             language: Language::Japanese,
         };
@@ -5007,6 +6008,7 @@ mod tests {
         assert_eq!(draft.prefetch, PrefetchSettings::default());
         assert!(draft.thumbnails_visible);
         assert_eq!(draft.reading_mode, ReadingMode::Single);
+        assert!(draft.auto_wide);
         assert_eq!(draft.comic_arrow_direction, ComicArrowDirection::RightNext);
         assert_eq!(draft.language, Language::Automatic);
     }
@@ -5026,7 +6028,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_reading_mode_change_needs_a_reload() {
+    fn reading_mode_change_detection_ignores_other_settings() {
         let active = AppSettings::default();
         let mut draft = active.clone();
         draft.prefetch.before = 9;
@@ -5137,6 +6139,10 @@ mod tests {
         assert_eq!(draft.language, Language::English, "both arrows cycle");
         step_draft_setting(SETTING_PREVIEWS, false, &mut draft);
         assert!(!draft.thumbnails_visible);
+        step_draft_setting(SETTING_AUTO_WIDE, false, &mut draft);
+        assert!(!draft.auto_wide);
+        step_draft_setting(SETTING_AUTO_WIDE, true, &mut draft);
+        assert!(draft.auto_wide);
     }
 
     #[test]
@@ -5619,7 +6625,12 @@ mod tests {
         });
         prefetch.set_purpose(DecodePurpose::Animated);
         let good = prepare(
-            requested_work(paths[1].clone(), &prefetch, ReadingMode::Book),
+            requested_source_work_spread(
+                SourceRef::file(&paths[1]),
+                &prefetch,
+                ReadingMode::Book,
+                vec![1, 2],
+            ),
             &AtomicBool::new(false),
         )
         .image
@@ -5627,7 +6638,12 @@ mod tests {
         assert_eq!(good.others.len(), 1);
         std::fs::write(&paths[2], b"broken partner").unwrap();
         let failed = prepare(
-            requested_work(paths[1].clone(), &prefetch, ReadingMode::Book),
+            requested_source_work_spread(
+                SourceRef::file(&paths[1]),
+                &prefetch,
+                ReadingMode::Book,
+                vec![1, 2],
+            ),
             &AtomicBool::new(false),
         );
         assert!(failed.image.is_err());
