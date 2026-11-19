@@ -21,9 +21,12 @@
   5,450,296 B; AppImage 8,317,432 B; DMG 11,259,563 B; MSI 4,608,000 B). The
   macOS job needed two reruns because `macos-latest` was not assigned for 15
   minutes each time; the third attempt passed.
-- The tag workflow and draft Release have not been run. Native visual and
-  interactive acceptance of the editing UI remains unverified; Windows is
-  unsigned and macOS is ad-hoc signed.
+- Tag workflow 44512526910 succeeded on Linux, macOS, and Windows and created a
+  draft Release with deb 5,451,076 B / AppImage 8,317,432 B / DMG 11,259,547 B /
+  MSI 4,603,904 B plus `SHA256SUMS`; all four hashes verified locally.
+- The Release is still a draft. Native visual and interactive acceptance of the
+  editing UI remains unverified; Windows is unsigned and macOS is ad-hoc
+  signed.
 
 **v0.2.0** — 2026-11-18
 

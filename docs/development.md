@@ -335,8 +335,9 @@ Final v0.3.0 status (2026-11-18, Linux/Rust 1.99; CI and dry-run on 2026-11-19):
   for 15 minutes each time (queued, then cancelled with no steps and no runner);
   the third attempt ran and passed. This was runner availability, not a script
   failure.
-- The tag workflow and draft Release have **not** been run, so no published
-  0.3.0 assets or `SHA256SUMS` exist yet.
+- The tag workflow 44512526910 succeeded on all three platforms and created a
+  **draft** Release with the four installers and `SHA256SUMS`; all four hashes
+  verified locally with `sha256sum --check`. The draft is not published yet.
 - Native visual/interactive acceptance of the editing toolbar, crop overlay,
   save confirmation, and Save As dialog remains unverified.
 
@@ -439,8 +440,22 @@ dry-run 44321689650 then succeeded and uploaded all four installers:
 - `oxeye-0.3.0-macos-universal.dmg` — **11,259,563 B**
 - `oxeye-0.3.0-windows-x86_64.msi` — **4,608,000 B**
 
-These are dry-run artifact sizes, not published assets; the tag workflow, the
-`SHA256SUMS` file, and the draft Release have **not** been created. Interactive
+These were dry-run artifact sizes. The tag workflow 44512526910 then built the
+same four installers again (builds are not byte-reproducible) and created a
+**draft** Release with `SHA256SUMS`:
+
+- `oxeye-0.3.0-linux-amd64.deb` — 5,451,076 B,
+  `3a279d5f…0624c9`
+- `oxeye-0.3.0-linux-x86_64.AppImage` — 8,317,432 B,
+  `a4af60cd…ed2940`
+- `oxeye-0.3.0-macos-universal.dmg` — 11,259,547 B,
+  `3bdf1f5a…c9fd528`
+- `oxeye-0.3.0-windows-x86_64.msi` — 4,603,904 B,
+  `187c67f5…7ea0bc`
+
+`sha256sum --check SHA256SUMS` passed for all four downloads. The Release is
+still a draft; publishing requires a maintainer to run
+`gh release edit v0.3.0 --draft=false` after review. Interactive
 installer UI, real macOS Intel hardware, Gatekeeper/SmartScreen approval, and
 actual GPU/hardware behavior remain unverified; Windows is unsigned and macOS is
 ad-hoc signed. Native visual and interactive acceptance of the editing UI is
