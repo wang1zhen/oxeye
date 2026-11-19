@@ -373,6 +373,24 @@ was available. Archive and wide-page native visual acceptance for v0.3.0 is not
 recorded here, and the new editing UI has only unit/state-machine evidence. No
 images were copied or uploaded, and test windows were closed afterwards.
 
+### Editing UI acceptance checklist (not yet run)
+
+Check these on a real window before publishing the v0.3.0 draft:
+
+1. Toolbar at the 560 pt minimum width: wrapping order, separators, and the
+   `Editing` / `Editing · unsaved` label stay readable.
+2. Disabled buttons (0.5 alpha) in both themes, plus `Save` disabled inside an
+   archive with its hover reason visible.
+3. Editing badge over a bright white image, and its absence during cropping.
+4. Crop handles on a tiny/1×1 selection: each handle grabs itself, no jump when
+   dragging outward handles, cursors change per handle.
+5. High-DPI / fractional scaling: crop edges sit within one physical pixel of
+   the painted image, and the below-0.5-pt zoom hint appears sensibly.
+6. Save confirmation: long paths wrap, JPEG quality slider appears only for
+   JPEG, and Enter (with any modifiers) never confirms.
+7. One real end-to-end overwrite and one Save As, including the failure notice
+   path (for example a read-only directory) and closing during a save.
+
 ## Platform prerequisites
 
 - Linux: OpenGL/EGL, Wayland or X11, and a desktop portal. CI installs
