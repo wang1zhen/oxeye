@@ -321,7 +321,7 @@ Final v0.3.0 status (2026-11-18, Linux/Rust 1.99; CI and dry-run on 2026-11-19):
 
 - `cargo fmt --all -- --check`: pass.
 - `CARGO_BUILD_JOBS=2 cargo check --locked --all-targets`: pass.
-- `CARGO_BUILD_JOBS=2 cargo test --locked --all-targets`: **366 pass, 2 ignored**.
+- `CARGO_BUILD_JOBS=2 cargo test --locked --all-targets`: **367 pass, 2 ignored**.
 - `CARGO_BUILD_JOBS=2 cargo clippy --locked --all-targets -- -D warnings`: pass.
 - `CARGO_BUILD_JOBS=2 cargo build --locked --release`: pass (1m 40s).
 - `cargo metadata --no-deps --format-version 1 --locked`: pass (Cargo.lock at 0.3.0).
@@ -338,8 +338,12 @@ Final v0.3.0 status (2026-11-18, Linux/Rust 1.99; CI and dry-run on 2026-11-19):
 - The tag workflow 44512526910 succeeded on all three platforms and created a
   **draft** Release with the four installers and `SHA256SUMS`; all four hashes
   verified locally with `sha256sum --check`. The draft is not published yet.
-- Native visual/interactive acceptance of the editing toolbar, crop overlay,
-  save confirmation, and Save As dialog remains unverified.
+- Editing UI acceptance ran on a real window on 2026-11-21 (see below). It found
+  four defects, which are fixed and covered by the 367-test suite; the draft
+  Release was rebuilt from the fixed tag.
+- Still unverified: pointer-driven crop dragging and handle resizing (no
+  Wayland pointer injection was available), light theme contrast, the native
+  Save As dialog, Windows/macOS GUI runs, and real Intel Mac hardware.
 
 Full acceptance commands:
 
@@ -367,29 +371,59 @@ exact PID/UUID, never the full desktop, with private files under ignored
 `target/acceptance/`. It covered a large image, a Book spread, dual
 finite+infinite and infinite+infinite spreads whose page regions changed,
 English/Simplified Chinese/Japanese and Automatic-Japanese screenshots, CJK
-glyphs, and visible/hidden preview strips. Settings-modal and input-driven
-behavior remain unit/source evidence only because no safe targeted Wayland input
-was available. Archive and wide-page native visual acceptance for v0.3.0 is not
-recorded here, and the new editing UI has only unit/state-machine evidence. No
-images were copied or uploaded, and test windows were closed afterwards.
+glyphs, and visible/hidden preview strips. Archive and wide-page native visual
+acceptance for v0.3.0 is still not recorded here. No images were copied or
+uploaded, and test windows were closed afterwards.
 
-### Editing UI acceptance checklist (not yet run)
+### Editing UI acceptance (2026-11-21)
 
-Check these on a real window before publishing the v0.3.0 draft:
+Method: KWin `ScreenShot2` app-only captures by exact PID/UUID plus `XTEST`
+keyboard events, after activating only the Oxeye window through a private KWin
+script; the previous active window was left untouched and every window was
+closed afterwards. Window 1369×982 at DPI 1.25 (fractional scaling), synthetic
+fixtures only.
 
-1. Toolbar at the 560 pt minimum width: wrapping order, separators, and the
-   `Editing` / `Editing · unsaved` label stay readable.
-2. Disabled buttons (0.5 alpha) in both themes, plus `Save` disabled inside an
-   archive with its hover reason visible.
-3. Editing badge over a bright white image, and its absence during cropping.
-4. Crop handles on a tiny/1×1 selection: each handle grabs itself, no jump when
-   dragging outward handles, cursors change per handle.
-5. High-DPI / fractional scaling: crop edges sit within one physical pixel of
-   the painted image, and the below-0.5-pt zoom hint appears sensibly.
-6. Save confirmation: long paths wrap, JPEG quality slider appears only for
-   JPEG, and Enter (with any modifiers) never confirms.
-7. One real end-to-end overwrite and one Save As, including the failure notice
-   path (for example a read-only directory) and closing during a save.
+Verified:
+
+1. Edit toolbar and crop layer render; six aspect segments, `Apply crop`,
+   `Cancel crop`, gesture hint, pixel-size readout.
+2. Rotation and flip produce the expected pixel orientation (red/green/blue/
+   white quadrants), and `Ctrl+Z` restores the previous step.
+3. Overwrite confirmation shows the full path, format, metadata-loss and
+   irreversibility warnings, quality control, and an "atomic swap" footnote; the
+   background is dimmed (blue 32/80/208 → 20/49/127, about 0.61×).
+4. `Enter` never confirms, including with modifiers. `Tab` + `Space` on the
+   focused `Replace` then performed a real overwrite: 1600×1000 became
+   1000×1600 with the baked rotation applied exactly once, the session exited,
+   the `Saved.` banner appeared, and the thumbnail refreshed.
+5. Read-only directory: save fails with a visible `Save failed … Permission
+   denied` banner, the edit session and dirty state survive, the original bytes
+   are unchanged, and no temp file is left behind.
+6. GIF is refused with the localized "not editable" notice (animation keeps
+   playing). A CBZ member can be edited, but `Ctrl+S` shows the
+   "archive members cannot be overwritten" notice and `Save` is disabled.
+7. 16×16 image at 100%: crop handles push outward and stay individually
+   grabbable. Fullscreen keeps the edit toolbar and footer.
+8. 560 pt minimum width: the edit toolbar wraps in reading order; the crop hint
+   row wraps to a second line instead of overflowing; the confirmation dialog
+   shows the parent directory and file name on separate lines.
+
+Defects found and fixed in this pass:
+
+1. The "zoom in for pixel-accurate cropping" hint compared logical points per
+   source pixel while the footer shows physical pixels, so at DPI 1.25 it
+   appeared at 57%. Both now use `scale * dpi` (hint at 42%, absent at 53%).
+2. The confirmation dialog broke the file name across lines; the parent
+   directory and file name are now separate labels.
+3. Footer Previous/Next and the wide-page button looked enabled during editing
+   although `perform` ignores them; they are now disabled with the session.
+4. The crop hint row overflowed the 560 pt window; it now wraps and the hint is
+   width-limited with an ellipsis.
+
+Remaining gaps: pointer-driven crop creation/resize (Wayland pointer injection
+is unavailable, so handle hit-testing and drag math are covered only by unit
+tests), light theme contrast, the native Save As file dialog, and Windows/macOS
+GUI runs.
 
 ## Platform prerequisites
 

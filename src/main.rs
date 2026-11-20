@@ -799,14 +799,22 @@ fn crop_cursor(handle: CropHandle) -> CursorIcon {
     }
 }
 
-/// Ergonomics hint, not a hard limit: below half a point per image pixel a
-/// boundary is too coarse to place deliberately, so the toolbar suggests zooming.
-fn crop_needs_zoom(scale: f32) -> bool {
-    scale < 0.5
+/// Ergonomics hint, not a hard limit: below half a physical pixel per source
+/// pixel a boundary is too coarse to place deliberately. This uses the same
+/// unit as the footer percentage (`scale * dpi`), so the hint cannot contradict
+/// the visible zoom label.
+fn crop_needs_zoom(scale: f32, dpi: f32) -> bool {
+    scale * dpi < 0.5
 }
 
 /// Moving window for the indeterminate progress bar, in points from the track's
 /// left edge. Never wider than the thumb and never outside the track.
+/// Footer navigation mirrors the `perform` interception list: while editing the
+/// buttons are disabled instead of looking clickable but silently doing nothing.
+fn footer_navigation_enabled(editing: bool, base: bool) -> bool {
+    base && !editing
+}
+
 fn indeterminate_span(phase: f32, width: f32) -> (f32, f32) {
     let thumb = (width * 0.3).min(120.);
     let start = phase.clamp(0., 1.) * (width - thumb).max(0.);
@@ -5294,8 +5302,15 @@ impl Oxeye {
         let zoom = self.zoom_label(ui.ctx());
         let status = self.status_text();
         let has_image = self.tiled.is_some();
-        let previous = !self.navigation.is_idle() || self.neighbor(false).is_some();
-        let next = !self.navigation.is_idle() || self.neighbor(true).is_some();
+        let editing = self.editing();
+        let previous = footer_navigation_enabled(
+            editing,
+            !self.navigation.is_idle() || self.neighbor(false).is_some(),
+        );
+        let next = footer_navigation_enabled(
+            editing,
+            !self.navigation.is_idle() || self.neighbor(true).is_some(),
+        );
         let playing = self.playing();
         let has_playback = self.has_animation();
         let finished = self.all_finished();
@@ -5324,7 +5339,7 @@ impl Oxeye {
                         && action_button(
                             ui,
                             text.wide_label(mode),
-                            true,
+                            footer_navigation_enabled(editing, true),
                             mode != PageOverride::Auto,
                             palette,
                             text.wide_tooltip,
@@ -5600,7 +5615,10 @@ impl Oxeye {
                     }
                 });
                 if let Some((_, rect)) = crop {
-                    ui.horizontal(|ui| {
+                    // Wrap instead of overflowing: on a 560 pt window the zoom
+                    // hint moves to the next row. Cap it at 240 pt using the
+                    // helper's reserve argument, so it keeps the usual ellipsis.
+                    ui.horizontal_wrapped(|ui| {
                         truncated_label(ui, text.crop_hint, 11., palette.muted, 210.);
                         ui.label(
                             RichText::new(text.dimensions(rect.w, rect.h))
@@ -5608,12 +5626,12 @@ impl Oxeye {
                                 .monospace()
                                 .color(palette.text),
                         );
-                        if viewport.width() > 0. && crop_needs_zoom(zoom_scale) {
-                            ui.label(
-                                RichText::new(text.crop_zoom_hint)
-                                    .size(11.)
-                                    .color(palette.warning),
-                            );
+                        if viewport.width() > 0.
+                            && crop_needs_zoom(zoom_scale, ui.ctx().pixels_per_point())
+                        {
+                            let remaining = ui.available_width();
+                            let reserve = (remaining - 240.).max(0.);
+                            truncated_label(ui, text.crop_zoom_hint, 11., palette.warning, reserve);
                         }
                     });
                 }
@@ -5673,14 +5691,31 @@ impl Oxeye {
                     .wrap(),
                 );
                 ui.add_space(2.);
+                let parent = path
+                    .parent()
+                    .map(|parent| parent.display().to_string())
+                    .unwrap_or_default();
+                if !parent.is_empty() {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(parent)
+                                .size(11.)
+                                .monospace()
+                                .color(palette.muted),
+                        )
+                        .wrap(),
+                    );
+                }
+                // Keep the file name on one line: truncation beats splitting the
+                // extension away from the stem in the confirmation dialog.
                 ui.add(
                     egui::Label::new(
-                        RichText::new(path.display().to_string())
+                        RichText::new(&name)
                             .size(11.)
                             .monospace()
-                            .color(palette.muted),
+                            .color(palette.text),
                     )
-                    .wrap(),
+                    .truncate(),
                 );
                 ui.label(
                     RichText::new(text.save_confirm_format(format_label(format)))
@@ -9477,10 +9512,23 @@ mod tests {
     }
 
     #[test]
-    fn crop_zoom_hint_only_appears_below_half_a_point_per_pixel() {
-        assert!(crop_needs_zoom(0.2));
-        assert!(!crop_needs_zoom(0.5));
-        assert!(!crop_needs_zoom(1.));
+    fn crop_zoom_hint_only_appears_below_half_a_pixel_per_pixel() {
+        assert!(crop_needs_zoom(0.2, 1.));
+        assert!(!crop_needs_zoom(0.5, 1.));
+        assert!(!crop_needs_zoom(1., 1.));
+        // The hint must agree with the footer's physical-pixel percentage.
+        assert!(!crop_needs_zoom(0.45, 1.25));
+        assert!(crop_needs_zoom(0.35, 1.25));
+        assert!(crop_needs_zoom(0.2, 2.));
+        assert!(!crop_needs_zoom(0.25, 2.));
+    }
+
+    #[test]
+    fn footer_navigation_buttons_disable_during_editing() {
+        assert!(!footer_navigation_enabled(true, true));
+        assert!(footer_navigation_enabled(false, true));
+        assert!(!footer_navigation_enabled(false, false));
+        assert!(!footer_navigation_enabled(true, false));
     }
 
     #[test]

@@ -258,7 +258,7 @@ pub static EN: Catalog = Catalog {
 
     editing: "Editing",
     editing_unsaved: "Editing · unsaved",
-    edit_unsupported_format: "Editing supports only PNG, JPEG, WebP, and BMP. GIF, TIFF, ICO, and other archive members stay read-only.",
+    edit_unsupported_format: "Editing supports only PNG, JPEG, WebP, and BMP. GIF, TIFF, and ICO stay read-only; archive members can be edited but only saved as a copy.",
     edit_single_frame: "Editing supports a single still image; animations stay read-only.",
     edit_source_mismatch: "The selected file does not match the displayed image; reopen it before editing.",
     edit_failed_prefix: "Could not edit: ",
@@ -430,7 +430,7 @@ pub static ZH: Catalog = Catalog {
 
     editing: "编辑中",
     editing_unsaved: "编辑中 · 未保存",
-    edit_unsupported_format: "仅支持编辑 PNG、JPEG、WebP、BMP。GIF、TIFF、ICO 以及其他压缩包成员保持只读。",
+    edit_unsupported_format: "仅支持编辑 PNG、JPEG、WebP、BMP。GIF、TIFF、ICO 保持只读；压缩包成员可编辑，但只能另存为。",
     edit_single_frame: "仅支持编辑单张静态图片；动画保持只读。",
     edit_source_mismatch: "所选文件与当前显示的图片不一致，请重新打开后再编辑。",
     edit_failed_prefix: "无法编辑：",
@@ -602,7 +602,7 @@ pub static JA: Catalog = Catalog {
 
     editing: "編集中",
     editing_unsaved: "編集中・未保存",
-    edit_unsupported_format: "編集できるのは PNG、JPEG、WebP、BMP のみです。GIF、TIFF、ICO、その他の書庫内ファイルは読み取り専用です。",
+    edit_unsupported_format: "編集できるのは PNG、JPEG、WebP、BMP のみです。GIF、TIFF、ICO は読み取り専用で、書庫内ファイルは編集できますが「名前を付けて保存」のみです。",
     edit_single_frame: "編集できるのは静止画像 1 枚のみです。アニメーションは読み取り専用です。",
     edit_source_mismatch: "選択中のファイルと表示中の画像が一致しません。開き直してから編集してください。",
     edit_failed_prefix: "編集できません：",
