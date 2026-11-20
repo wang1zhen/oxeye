@@ -328,16 +328,18 @@ Final v0.3.0 status (2026-11-18, Linux/Rust 1.99; CI and dry-run on 2026-11-19):
 - `bash -n packaging/linux/package.sh`, `bash -n packaging/macos/package.sh`,
   `plistlib` parse of `packaging/macos/Info.plist` (both version keys `0.3.0`),
   and `python3` XML parse of `packaging/windows/main.wxs`: pass.
-- CI for commit `8dffff8` passed on Linux, macOS, and Windows
-  (run 44321681029).
+- CI for commit `e45d84e` passed on Linux, macOS, and Windows
+  (run 44790382290); the earlier commit `8dffff8` also passed (run 44321681029).
 - Packaging dry-run 44321689650 succeeded and uploaded all four installers. The
   macOS job needed two `--failed` reruns because `macos-latest` was not assigned
   for 15 minutes each time (queued, then cancelled with no steps and no runner);
   the third attempt ran and passed. This was runner availability, not a script
   failure.
-- The tag workflow 44512526910 succeeded on all three platforms and created a
-  **draft** Release with the four installers and `SHA256SUMS`; all four hashes
-  verified locally with `sha256sum --check`. The draft is not published yet.
+- Tag workflow 44790389886 built all four installers for `e45d84e` and created
+  the **draft** Release with `SHA256SUMS`; all four hashes verified locally with
+  `sha256sum --check`. An earlier tag run (44512526910) was superseded after the
+  native-acceptance fixes, and its draft was deleted. The draft is not published
+  yet.
 - Editing UI acceptance ran on a real window on 2026-11-21 (see below). It found
   four defects, which are fixed and covered by the 367-test suite; the draft
   Release was rebuilt from the fixed tag.
@@ -492,18 +494,18 @@ dry-run 44321689650 then succeeded and uploaded all four installers:
 - `oxeye-0.3.0-macos-universal.dmg` — **11,259,563 B**
 - `oxeye-0.3.0-windows-x86_64.msi` — **4,608,000 B**
 
-These were dry-run artifact sizes. The tag workflow 44512526910 then built the
-same four installers again (builds are not byte-reproducible) and created a
+These were dry-run artifact sizes. Tag workflow 44790389886 then built the same
+four installers from `e45d84e` (builds are not byte-reproducible) and created a
 **draft** Release with `SHA256SUMS`:
 
-- `oxeye-0.3.0-linux-amd64.deb` — 5,451,076 B,
-  `3a279d5f…0624c9`
-- `oxeye-0.3.0-linux-x86_64.AppImage` — 8,317,432 B,
-  `a4af60cd…ed2940`
-- `oxeye-0.3.0-macos-universal.dmg` — 11,259,547 B,
-  `3bdf1f5a…c9fd528`
-- `oxeye-0.3.0-windows-x86_64.msi` — 4,603,904 B,
-  `187c67f5…7ea0bc`
+- `oxeye-0.3.0-linux-amd64.deb` — 5,451,408 B,
+  `ec994d19…1159df`
+- `oxeye-0.3.0-linux-x86_64.AppImage` — 8,321,528 B,
+  `47b5d83a…7d74808c`
+- `oxeye-0.3.0-macos-universal.dmg` — 11,260,076 B,
+  `d0293487…f7d04d7`
+- `oxeye-0.3.0-windows-x86_64.msi` — 4,608,000 B,
+  `6ee4b9ed…7483028b8`
 
 `sha256sum --check SHA256SUMS` passed for all four downloads. The Release is
 still a draft; publishing requires a maintainer to run

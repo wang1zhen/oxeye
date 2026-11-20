@@ -16,17 +16,25 @@
   dimensions → thumbnail generation → reload at turns=0).
 - Closing the window waits for a running image save; the edit session restores
   the original frame and display rotation on exit.
-- CI for commit 8dffff8 passed on Linux, macOS, and Windows (run 44321681029).
-  Packaging dry-run 44321689650 uploaded all four 0.3.0 installers (deb
-  5,450,296 B; AppImage 8,317,432 B; DMG 11,259,563 B; MSI 4,608,000 B). The
-  macOS job needed two reruns because `macos-latest` was not assigned for 15
-  minutes each time; the third attempt passed.
-- Tag workflow 44512526910 succeeded on Linux, macOS, and Windows and created a
-  draft Release with deb 5,451,076 B / AppImage 8,317,432 B / DMG 11,259,547 B /
-  MSI 4,603,904 B plus `SHA256SUMS`; all four hashes verified locally.
-- The Release is still a draft. Native visual and interactive acceptance of the
-  editing UI remains unverified; Windows is unsigned and macOS is ad-hoc
-  signed.
+- CI for commit `e45d84e` passed on Linux, macOS, and Windows (run
+  44790382290); commit `8dffff8` also passed (run 44321681029). Packaging
+  dry-run 44321689650 uploaded all four 0.3.0 installers (deb 5,450,296 B;
+  AppImage 8,317,432 B; DMG 11,259,563 B; MSI 4,608,000 B). The macOS job needed
+  two reruns because `macos-latest` was not assigned for 15 minutes each time;
+  the third attempt passed.
+- Tag workflow 44790389886 built the four installers from `e45d84e` and created
+  a draft Release with deb 5,451,408 B / AppImage 8,321,528 B / DMG 11,260,076 B
+  / MSI 4,608,000 B plus `SHA256SUMS`; all four hashes verified locally.
+- Native editing acceptance ran on a real window on 2026-11-21 (app-only KWin
+  captures, XTEST keyboard, DPI 1.25). It verified the edit toolbar, crop layer,
+  rotate/flip/undo pixels, the confirmation dialog, Enter never confirming, a
+  real overwrite, the failure path, GIF refusal, CBZ members, tiny-image
+  handles, and 560 pt wrapping. Four defects it found are fixed (crop zoom hint
+  units, dialog path wrapping, footer gating while editing, hint-row overflow)
+  and the tag was rebuilt afterwards.
+- The Release is still a draft. Pointer-driven crop drag/resize, light theme,
+  the native Save As dialog, and Windows/macOS GUI runs remain unverified;
+  Windows is unsigned and macOS is ad-hoc signed.
 
 **v0.2.0** — 2026-11-18
 
